@@ -1,4 +1,4 @@
-"""TDD Red 子任务 C：MainWindow 行为测试（仅测试，无生产实现）。
+"""MainWindow 行为测试。
 
 固定 API 契约（来自任务书）：
 - ``paimon_assistant.main_window.MainWindow(controller=...)``
@@ -148,6 +148,184 @@ def test_refresh_re_enumerates_ports(window, controller):
     window.refresh_button.click()
     assert controller.list_ports_calls == before + 1
     assert "COM7" in _combo_items(window.port_combo)
+
+
+# ---------- 端口轮询与差量更新 ----------
+
+
+def test_poll_timer_interval_1000ms_and_active(window):
+    """轮询定时器约 1 秒驱动 monitor.tick()。"""
+    assert window._poll_timer.interval() == 1000
+    assert window._poll_timer.isActive()
+
+
+def test_new_port_appears_without_refresh(window, controller):
+    """新插入的端口不点「刷新」，下一次 tick 即出现在列表中。"""
+    controller.ports = ["COM3", "COM4", "COM9"]
+    window._monitor.tick()
+    assert _combo_items(window.port_combo) == ["COM3", "COM4", "COM9"]
+
+
+def test_removed_port_disappears_without_refresh(window, controller):
+    """被拔掉的端口下一次 tick 即从列表消失。"""
+    controller.ports = ["COM4"]
+    window._monitor.tick()
+    assert _combo_items(window.port_combo) == ["COM4"]
+
+
+def test_same_snapshot_tick_keeps_list_unchanged(window, controller):
+    before = _combo_items(window.port_combo)
+    window._monitor.tick()
+    assert _combo_items(window.port_combo) == before
+
+
+def test_refresh_uses_diff_path_without_rebuild(window, controller):
+    """手动刷新走差量路径：未变化的项不被 clear/rebuild，保留对象数据。"""
+    window.port_combo.setItemData(0, "keep-me")
+    before = controller.list_ports_calls
+    window.refresh_button.click()
+    assert controller.list_ports_calls == before + 1
+    assert _combo_items(window.port_combo) == ["COM3", "COM4"]
+    assert window.port_combo.itemData(0) == "keep-me"
+
+
+def test_list_updates_while_open_and_combo_stays_disabled(window, controller):
+    """连接打开期间列表数据仍更新，下拉框保持禁用。"""
+    _open(window)
+    controller.ports = ["COM3", "COM9"]
+    window._monitor.tick()
+    assert _combo_items(window.port_combo) == ["COM3", "COM9"]
+    assert not window.port_combo.isEnabled()
+    assert window.refresh_button.isEnabled()
+    assert window.open_button.text() == "关闭"
+
+
+# ---------- REQ-0002 selection and removal policies ----------
+
+
+def test_auto_selects_first_added_port_when_selection_is_empty(window, controller):
+    window.port_combo.setCurrentIndex(-1)
+    controller.ports = ["COM3", "COM4", "COM9", "COM10"]
+    window._monitor.tick()
+
+    assert _combo_items(window.port_combo) == ["COM3", "COM4", "COM9", "COM10"]
+    assert window.port_combo.currentText() == "COM9"
+    assert controller.opened_settings == []
+
+
+def test_preserves_valid_selection_when_port_is_added(window, controller):
+    _select(window.port_combo, "COM4")
+    controller.ports = ["COM3", "COM4", "COM9"]
+    window._monitor.tick()
+
+    assert _combo_items(window.port_combo) == ["COM3", "COM4", "COM9"]
+    assert window.port_combo.currentText() == "COM4"
+    assert controller.opened_settings == []
+
+
+def test_selects_first_new_port_when_selected_port_is_removed_same_tick(
+    window, controller
+):
+    assert window.port_combo.currentText() == "COM3"
+    controller.ports = ["COM4", "COM9", "COM10"]
+    window._monitor.tick()
+
+    assert _combo_items(window.port_combo) == ["COM4", "COM9", "COM10"]
+    assert window.port_combo.currentText() == "COM9"
+    assert controller.opened_settings == []
+
+
+def test_removed_unselected_port_is_silent(window, controller, dialogs):
+    _select(window.port_combo, "COM4")
+    controller.ports = ["COM4"]
+    window._monitor.tick()
+
+    assert _combo_items(window.port_combo) == ["COM4"]
+    assert window.port_combo.currentText() == "COM4"
+    assert dialogs["warning"] == []
+
+
+def test_removed_selected_unconnected_port_leaves_selection_empty(
+    window, controller, dialogs
+):
+    _select(window.port_combo, "COM3")
+    controller.ports = ["COM4"]
+    window._monitor.tick()
+
+    assert _combo_items(window.port_combo) == ["COM4"]
+    assert window.port_combo.currentIndex() == -1
+    assert window.port_combo.currentText() == ""
+    assert controller.opened_settings == []
+    assert dialogs["warning"] == []
+
+
+# ---------- REQ-0002 connected-port debounce ----------
+
+
+def test_connected_port_loss_closes_once_warns_once_and_keeps_diff_removal(
+    window, controller, dialogs
+):
+    _open(window)
+    controller.ports = ["COM4"]
+
+    window._monitor.tick()
+    assert controller.close_calls == 0
+    assert dialogs["warning"] == []
+    assert _combo_items(window.port_combo) == ["COM4"]
+    assert window.open_button.text() == "关闭"
+
+    window._monitor.tick()
+    assert controller.close_calls == 1
+    assert len(dialogs["warning"]) == 1
+    assert dialogs["warning"][0][0][2] == "串口已拔出，连接已关闭"
+    assert window.open_button.text() == "打开"
+    assert window.port_combo.isEnabled()
+
+    window._monitor.tick()
+    assert controller.close_calls == 1
+    assert len(dialogs["warning"]) == 1
+
+
+def test_connected_port_recovery_does_not_close_or_warn(window, controller, dialogs):
+    _open(window)
+    controller.ports = []
+    window._monitor.tick()
+    controller.ports = ["COM3"]
+    window._monitor.tick()
+
+    assert controller.close_calls == 0
+    assert dialogs["warning"] == []
+
+    controller.ports = []
+    window._monitor.tick()
+    window._monitor.tick()
+    assert controller.close_calls == 1
+    assert len(dialogs["warning"]) == 1
+
+
+def test_manual_close_clears_loss_tracking(window, controller, dialogs):
+    _open(window)
+    window.open_button.click()
+    assert controller.close_calls == 1
+
+    controller.ports = []
+    window._monitor.tick()
+    window._monitor.tick()
+    assert controller.close_calls == 1
+    assert dialogs["warning"] == []
+
+
+def test_read_error_closes_without_lost_warning(window, controller, dialogs):
+    _open(window)
+    controller.error_queue.put(OSError("串口异常断开"))
+    window._drain_queues()
+    assert controller.close_calls == 1
+    assert len(dialogs["critical"]) == 1
+
+    controller.ports = []
+    window._monitor.tick()
+    window._monitor.tick()
+    assert dialogs["warning"] == []
 
 
 # ---------- 默认参数 ----------

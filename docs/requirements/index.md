@@ -7,3 +7,4 @@
 | 需求编号 | 功能名称 | 状态 | 创建日期 | 文档 |
 |---|---|---|---|---|
 | REQ-0001 | 派蒙助手：串口原始数据收发 | 已确认 | 2026-08-15 | [REQ-0001-serial-raw-io.md](REQ-0001-serial-raw-io.md) |
+| REQ-0002 | 派蒙助手：串口热插拔自动监测 | 已确认 | 2026-08-20 | [REQ-0002-serial-port-monitor.md](REQ-0002-serial-port-monitor.md) |

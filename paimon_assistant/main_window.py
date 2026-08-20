@@ -3,6 +3,8 @@
 Received bytes are drained from the controller in timed batches. Text mode
 uses an incremental decoder and HEX mode formats only newly arrived bytes;
 the complete raw history is re-rendered only when mode or encoding changes.
+Ports are polled every second via PortMonitor and the combo box is updated
+by diff (add/remove only), sharing one path with the manual refresh button.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from .codec import IncrementalTextDecoder, encode_text, format_hex, parse_hex_input
 from .config import BAUD_RATES, SerialSettings
+from .port_monitor import PortMonitor
 from .receive_buffer import ReceiveBuffer
 from .serial_controller import SerialController
 
@@ -44,6 +47,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("派蒙助手")
         self.controller = controller if controller is not None else SerialController()
 
+        # 端口列表监测：与轮询/手动刷新共用同一差量更新路径
+        self._monitor = PortMonitor(
+            port_lister=self.controller.list_ports,
+            on_added=self._on_ports_added,
+            on_removed=self._on_ports_removed,
+            on_lost=self._on_connected_port_lost,
+        )
+
         self._is_open = False
         self._receive_buffer = ReceiveBuffer()
         self._hex_has_content = False  # 显示区已有 HEX 内容（决定追加时的空格）
@@ -58,6 +69,12 @@ class MainWindow(QMainWindow):
         self._timer.setInterval(50)
         self._timer.timeout.connect(self._drain_queues)
         self._timer.start()
+
+        # 端口列表轮询：约 1 秒一次，差量更新（与手动刷新共用同一路径）
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(1000)
+        self._poll_timer.timeout.connect(self._monitor.tick)
+        self._poll_timer.start()
 
         self._set_open_state(False)
         self._refresh_ports()
@@ -194,12 +211,15 @@ class MainWindow(QMainWindow):
             self.data_bits_combo,
             self.parity_combo,
             self.stop_bits_combo,
-            self.refresh_button,
         ):
             widget.setEnabled(not open_state)
+        # Refresh remains available while connected so the disabled list can
+        # still be updated without changing the active serial link.
+        self.refresh_button.setEnabled(True)
         self.send_button.setEnabled(open_state)
 
     def _close_connection(self) -> None:
+        self._monitor.clear_connected()
         try:
             self.controller.close()
         except Exception:
@@ -209,8 +229,17 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------- enumeration
 
     def _refresh_ports(self) -> None:
-        if self._is_open:
-            return
+        """手动「刷新」：与轮询共用 monitor 的差量更新路径。
+
+        启动时下拉框仍为空，先让 monitor 建立初始化快照（首轮 tick 不产生
+        事件），再全量填充一次，保证启动后插入的端口能在下一轮被发现。
+        """
+        self._monitor.tick()
+        if self.port_combo.count() == 0:
+            self._fill_port_combo()
+
+    def _fill_port_combo(self) -> None:
+        """启动初始填充：全量枚举并填充下拉框，默认选中第一个。"""
         try:
             entries = list(self.controller.list_ports())
         except Exception:
@@ -223,6 +252,49 @@ class MainWindow(QMainWindow):
             self.port_combo.setCurrentText(current)
         elif names:
             self.port_combo.setCurrentIndex(0)
+
+    # -------------------------------------------------- 差量事件处理
+
+    def _on_ports_added(self, ports) -> None:
+        current = self.port_combo.currentText()
+        added = []
+        for name in ports:
+            if self.port_combo.findText(name) == -1:
+                self.port_combo.addItem(name)
+                added.append(name)
+        if not added:
+            return
+
+        # PortMonitor updates its snapshot before callbacks. This also handles
+        # an old selection removed in the same tick as a new port is added.
+        if (
+            not current
+            or self.port_combo.findText(current) == -1
+            or (
+                self._monitor._last is not None
+                and current not in self._monitor._last
+            )
+        ):
+            self.port_combo.setCurrentText(added[0])
+
+    def _on_ports_removed(self, ports) -> None:
+        current = self.port_combo.currentText()
+        current_removed = False
+        for name in ports:
+            index = self.port_combo.findText(name)
+            if index == -1:
+                continue
+            if name == current:
+                current_removed = True
+            self.port_combo.removeItem(index)
+        if current_removed:
+            self.port_combo.setCurrentIndex(-1)
+
+    def _on_connected_port_lost(self, port: str) -> None:
+        if not self._is_open:
+            return
+        self._close_connection()
+        QMessageBox.warning(self, "串口已拔出", "串口已拔出，连接已关闭")
 
     # -------------------------------------------------------- open / close
 
@@ -247,6 +319,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "打开失败", str(exc))
             return
         self._set_open_state(True)
+        self._monitor.set_connected(port)
 
     # ------------------------------------------------------------- receive
 
@@ -396,5 +469,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._timer.stop()
+        self._poll_timer.stop()
         self._close_connection()
         super().closeEvent(event)
