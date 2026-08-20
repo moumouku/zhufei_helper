@@ -7,6 +7,7 @@
 完整操作步骤见 [docs/user-manual.md](docs/user-manual.md)。
 按功能独立管理的需求文档见 [docs/requirements/index.md](docs/requirements/index.md)。
 版本变更及实现清单见 [CHANGELOG.md](CHANGELOG.md)。
+使用 AI 更新并安全发布新版本见 [docs/ai-update-guide.md](docs/ai-update-guide.md)。
 
 ## 功能
 

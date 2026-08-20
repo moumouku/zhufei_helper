@@ -1,5 +1,8 @@
 .venv/
-.pi/
+.pi/*
+!.pi/prompts/
+.pi/prompts/*
+!.pi/prompts/update-paimon.md
 __pycache__/
 *.py[cod]
 .pytest_cache/
