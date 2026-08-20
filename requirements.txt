@@ -1,0 +1,4 @@
+# Paimon Assistant 运行/打包实际依赖（本期只用 pyserial + PySide6）
+pyserial>=3.5
+PySide6>=6.6,<7
+PyInstaller>=6,<7

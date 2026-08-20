@@ -1,0 +1,4 @@
+# 开发/测试依赖：先安装运行与打包依赖
+-r requirements.txt
+pytest>=8,<9
+pytest-qt>=4.4,<5
