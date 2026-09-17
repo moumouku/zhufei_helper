@@ -10,7 +10,21 @@
 
 ### 2.1 使用已打包版本
 
-双击下面的文件：
+从 GitHub Release 下载单文件程序：
+
+```text
+https://github.com/moumouku/zhufei_helper/releases/latest
+```
+
+下载 `PaimonAssistant.exe` 后双击运行即可。打包版本不需要目标电脑安装 Python，也不需要安装任何依赖。
+
+Release 页面的发布说明里给出了该文件的 SHA256，可在下载后校验：
+
+```powershell
+Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
+```
+
+在开发环境中也可以直接运行本地构建产物：
 
 ```text
 E:\projects_learning\zhufei_helps\dist\PaimonAssistant.exe
@@ -21,8 +35,6 @@ E:\projects_learning\zhufei_helps\dist\PaimonAssistant.exe
 ```powershell
 & "E:\projects_learning\zhufei_helps\dist\PaimonAssistant.exe"
 ```
-
-打包版本不需要目标电脑安装 Python。
 
 ### 2.2 使用源码版本
 

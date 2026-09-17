@@ -9,6 +9,21 @@
 版本变更及实现清单见 [CHANGELOG.md](CHANGELOG.md)。
 使用 AI 更新并安全发布新版本见 [docs/ai-update-guide.md](docs/ai-update-guide.md)。
 
+## 下载
+
+面向使用者的单文件 Windows 程序，**无需安装 Python 或任何依赖**，下载后直接运行：
+
+- 最新版本：<https://github.com/moumouku/zhufei_helper/releases/latest>
+- `v0.4.0`：<https://github.com/moumouku/zhufei_helper/releases/tag/v0.4.0>
+
+每个 Release 页面的发布说明里同时给出 `PaimonAssistant.exe` 的 SHA256，可用下面的命令校验：
+
+```powershell
+Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
+```
+
+也可以使用源码运行或自行打包，见下方“安装依赖”和“打包”两节。
+
 ## 功能
 
 - 自动枚举可用 COM 口
