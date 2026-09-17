@@ -55,6 +55,11 @@ class FakeController:
     def write(self, data: bytes):
         self.writes.append(bytes(data))
 
+    def reset_receive_session(self):
+        """模拟真实控制器：清空时替换队列并丢弃待处理旧事件（REQ §10.1）。"""
+        self.received_queue = queue.Queue()
+        self.diagnostic_queue = queue.Queue()
+
 
 class FakeLogService:
     """日志服务测试替身：记录调用与目录操作，可注入写失败。"""
@@ -257,19 +262,6 @@ def test_diagnostic_queue_shows_fixed_text_without_blocking_display(
     # 诊断不阻断正常显示与日志
     assert window.display_edit.toPlainText() == "after\n"
     assert len(log_service.events) == 1
-
-
-def test_diagnostics_are_ignored_when_controller_has_no_diagnostic_queue(
-    tmp_path, qtbot, mw, controller
-):
-    """兼容尚未提供诊断队列的旧 controller：不得因缺少属性而报错。"""
-    del controller.diagnostic_queue
-    window = _window(qtbot, mw, controller, FakeLogService(tmp_path / "logs"))
-    window.timestamp_checkbox.setChecked(False)
-
-    controller.received_queue.put(FakeEvent(0, b"ok", b"ok\r\n"))
-    window._drain_queues()
-    assert window.display_edit.toPlainText() == "ok\n"
 
 
 # ------------------------------------------------------------ 日志目录入口

@@ -17,6 +17,8 @@ from dataclasses import dataclass  # noqa: E402
 
 import pytest  # noqa: E402
 
+from paimon_assistant.receive_log import ReceiveLogService  # noqa: E402
+
 
 @dataclass(frozen=True)
 class FakeEvent:
@@ -32,6 +34,7 @@ class FakeController:
 
     def __init__(self):
         self.received_queue = queue.Queue()
+        self.diagnostic_queue = queue.Queue()
         self.error_queue = queue.Queue()
 
     def list_ports(self):
@@ -46,6 +49,11 @@ class FakeController:
     def write(self, data):
         pass
 
+    def reset_receive_session(self):
+        """模拟真实控制器：清空时替换队列并丢弃待处理旧事件（REQ §10.1）。"""
+        self.received_queue = queue.Queue()
+        self.diagnostic_queue = queue.Queue()
+
 
 @pytest.fixture
 def mw():
@@ -58,8 +66,11 @@ def controller():
 
 
 @pytest.fixture
-def window(qtbot, mw, controller):
-    win = mw.MainWindow(controller=controller)
+def window(qtbot, mw, controller, tmp_path):
+    # 注入临时日志目录：整套测试不得写入真实 %LOCALAPPDATA%（REQ §14.5）。
+    win = mw.MainWindow(
+        controller=controller, log_service=ReceiveLogService(tmp_path / "logs")
+    )
     qtbot.addWidget(win)
     return win
 

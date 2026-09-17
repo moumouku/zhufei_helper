@@ -23,6 +23,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 
+from paimon_assistant.receive_log import ReceiveLogService  # noqa: E402
+
 PUBLIC_WIDGETS = [
     "port_combo",
     "baud_combo",
@@ -62,12 +64,14 @@ class FakeController:
     def __init__(self, ports=("COM3", "COM4")):
         self.ports = list(ports)
         self.received_queue = queue.Queue()
+        self.diagnostic_queue = queue.Queue()
         self.error_queue = queue.Queue()
         self.opened_settings = []  # 每次 open 收到的 SerialSettings
         self.close_calls = 0
         self.writes = []  # write(bytes) 记录
         self.list_ports_calls = 0
         self.open_exc = None  # 若设置，open() 抛出该异常
+        self.reset_calls = 0  # reset_receive_session() 调用次数
 
     def list_ports(self):
         self.list_ports_calls += 1
@@ -84,6 +88,12 @@ class FakeController:
 
     def write(self, data: bytes):
         self.writes.append(bytes(data))
+
+    def reset_receive_session(self):
+        """模拟真实控制器：递增代次并按新队列丢弃待处理旧事件（REQ §10.1）。"""
+        self.reset_calls += 1
+        self.received_queue = queue.Queue()
+        self.diagnostic_queue = queue.Queue()
 
 
 @pytest.fixture
@@ -115,8 +125,11 @@ def dialogs(mw, monkeypatch):
 
 
 @pytest.fixture
-def window(qtbot, mw, controller):
-    win = mw.MainWindow(controller=controller)
+def window(qtbot, mw, controller, tmp_path):
+    # 注入临时日志目录：整套测试不得写入真实 %LOCALAPPDATA%（REQ §14.5）。
+    win = mw.MainWindow(
+        controller=controller, log_service=ReceiveLogService(tmp_path / "logs")
+    )
     qtbot.addWidget(win)
     return win
 
@@ -540,6 +553,30 @@ def test_empty_hex_warns_and_no_write(window, controller, dialogs):
 
 
 # ---------- 清空 / 错误队列 ----------
+
+
+def test_clear_calls_reset_receive_session_and_drops_old_state(window, controller):
+    """清空必须以控制器会话重置为唯一线性化点（REQ-0003 §10.1）。"""
+    window._timer.stop()
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(_event("shown"))
+    window._drain_queues()
+    assert window.display_edit.toPlainText() == "shown\n"
+    controller.received_queue.put(_event("pending-not-drained"))
+    window.receive_error_label.setText("接收帧超过 1 MiB，已丢弃")
+
+    window.clear_button.click()
+
+    assert controller.reset_calls == 1
+    assert window.display_edit.toPlainText() == ""
+    assert window.receive_error_label.text() == ""
+
+    # 清空后切换显示设置不复活旧事件；新数据进入新会话并正常显示
+    _select(window.receive_mode_combo, "HEX")
+    assert window.display_edit.toPlainText() == ""
+    controller.received_queue.put(_event("new"))
+    window._drain_queues()
+    assert window.display_edit.toPlainText() == "6E 65 77 0D 0A\n"
 
 
 def test_clear_clears_display_and_history(window, controller):

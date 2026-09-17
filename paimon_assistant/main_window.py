@@ -377,17 +377,16 @@ class MainWindow(QMainWindow):
             self._render_history()
             self._write_events_to_log(events)
 
-        # 分帧诊断（超长帧）独立队列；旧 controller 未提供时跳过。
-        diagnostic_queue = getattr(self.controller, "diagnostic_queue", None)
-        if diagnostic_queue is not None:
-            diagnostics = []
-            while True:
-                try:
-                    diagnostics.append(diagnostic_queue.get_nowait())
-                except queue.Empty:
-                    break
-            if diagnostics:
-                self.receive_error_label.setText(str(diagnostics[-1]))
+        # 分帧诊断（超长帧）独立队列；控制器契约保证该队列存在（REQ-0003 §5.1.6）。
+        diagnostic_queue = self.controller.diagnostic_queue
+        diagnostics = []
+        while True:
+            try:
+                diagnostics.append(diagnostic_queue.get_nowait())
+            except queue.Empty:
+                break
+        if diagnostics:
+            self.receive_error_label.setText(str(diagnostics[-1]))
 
         errors = []
         while True:
@@ -463,14 +462,10 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- clear
 
     def _on_clear(self) -> None:
-        # 丢弃点击时 receive 队列中尚未 drain 的旧事件，避免随后 QTimer 把
-        # 清空前的事件重新显示；点击后新到达的事件不受影响。
-        received_queue = self.received_queue
-        while True:
-            try:
-                received_queue.get_nowait()
-            except queue.Empty:
-                break
+        # 清空的唯一线性化点（REQ-0003 §10.1）：reset_receive_session() 在会话锁内
+        # 递增代次、重置分帧器（丢弃未完成尾部与超长状态）并用新队列丢弃点击时
+        # 尚未 drain 的旧事件。未打开时也安全，不会创建串口连接。
+        self.controller.reset_receive_session()
         self._event_history.clear()
         self.receive_error_label.clear()
         self.display_edit.clear()
