@@ -11,12 +11,22 @@
 
 ## 下载
 
-面向使用者的单文件 Windows 程序，**无需安装 Python 或任何依赖**，下载后直接运行：
+仓库根目录直接提供单文件 Windows 程序，**无需安装 Python 或任何依赖**：
 
-- 最新版本：<https://github.com/moumouku/zhufei_helper/releases/latest>
-- `v0.4.0`：<https://github.com/moumouku/zhufei_helper/releases/tag/v0.4.0>
+```text
+PaimonAssistant.exe
+```
 
-每个 Release 页面的发布说明里同时给出 `PaimonAssistant.exe` 的 SHA256，可用下面的命令校验：
+- 仓库内直接获取（点开文件页面右上角的 Download raw file）：<https://github.com/moumouku/zhufei_helper/blob/main/PaimonAssistant.exe>
+- `v0.4.0` 发布页：<https://github.com/moumouku/zhufei_helper/releases/tag/v0.4.0>
+
+当前文件 SHA256：
+
+```text
+a8d55b28585a9912afd7ed8bd7d1fa37bb968ad6a869a6f3f152b3fae639df0a
+```
+
+下载后可用下面的命令校验：
 
 ```powershell
 Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
