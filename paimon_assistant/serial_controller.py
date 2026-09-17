@@ -78,12 +78,13 @@ class _ReceiveSession:
     fresh framer and queues.
     """
 
-    __slots__ = ("generation", "framer", "received_queue", "diagnostic_queue")
+    __slots__ = ("generation", "framer", "received_queue", "diagnostic_queue", "raw_queue")
 
     def __init__(self, generation: int, clock_ms: Callable[[], int]) -> None:
         self.generation = generation
         self.received_queue: queue.Queue = queue.Queue()
         self.diagnostic_queue: queue.Queue = queue.Queue()
+        self.raw_queue: queue.Queue = queue.Queue()
         self.framer = ReceiveFramer(clock_ms, on_overflow=self._on_overflow)
 
     def _on_overflow(self) -> None:
@@ -118,6 +119,7 @@ class SerialController:
         self._clock_ms = clock_ms
         self.received_queue: queue.Queue = queue.Queue()
         self.diagnostic_queue: queue.Queue = queue.Queue()
+        self.raw_queue: queue.Queue = queue.Queue()
         self.error_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._ser: Any = None
@@ -125,6 +127,7 @@ class SerialController:
         self._session_lock = threading.Lock()
         self._session: Optional[_ReceiveSession] = None
         self._generation = 0
+        self._raw_mode = False
         self._is_open = False
 
     # -- state -------------------------------------------------------------
@@ -200,6 +203,7 @@ class SerialController:
             self._session = session
             self.received_queue = session.received_queue
             self.diagnostic_queue = session.diagnostic_queue
+            self.raw_queue = session.raw_queue
             self.error_queue = error_queue
             self._stop = stop_event
             self._ser = ser
@@ -319,6 +323,28 @@ class SerialController:
 
     # -- session reset -----------------------------------------------------
 
+    def set_raw_mode(self, enabled: bool) -> None:
+        """Select raw-bytes receipt instead of ``0D 0A`` framing (REQ-0004 §3.4).
+
+        The flag lives on the controller so a later ``open()`` reuses it. A
+        real mode change also drops the framer's unfinished tail, because
+        bytes received while the other mode was active never reached the
+        framer and must not be joined with the pre-switch tail.
+        """
+        enabled = bool(enabled)
+        with self._session_lock:
+            if enabled == self._raw_mode:
+                return
+            self._raw_mode = enabled
+            if self._session is not None:
+                self._session.framer.reset()
+
+    @property
+    def raw_mode(self) -> bool:
+        """Current receipt mode: ``True`` for raw bytes, ``False`` for framing."""
+        with self._session_lock:
+            return self._raw_mode
+
     def reset_receive_session(self) -> None:
         """Atomically drop the current session's framing state and queued data.
 
@@ -332,16 +358,20 @@ class SerialController:
             self._generation += 1
             old_received = self.received_queue
             old_diagnostic = self.diagnostic_queue
+            old_raw = self.raw_queue
             self.received_queue = queue.Queue()
             self.diagnostic_queue = queue.Queue()
+            self.raw_queue = queue.Queue()
             session = self._session
             if session is not None:
                 session.generation = self._generation
                 session.received_queue = self.received_queue
                 session.diagnostic_queue = self.diagnostic_queue
+                session.raw_queue = self.raw_queue
                 session.framer.reset()
             _discard_pending(old_received)
             _discard_pending(old_diagnostic)
+            _discard_pending(old_raw)
 
     # -- background reader -------------------------------------------------
 
@@ -375,14 +405,18 @@ class SerialController:
                 stop_event.wait(self._READ_POLL)
 
     def _publish_events(self, session: _ReceiveSession, data: bytes) -> None:
-        """Frame one read chunk and enqueue its events under the session lock.
+        """Publish one read chunk under the session lock, in the active mode.
 
         Holding the lock across feed + enqueue makes ``reset_receive_session``
         a single linearization point, and the generation check drops output
         from a reader whose connection was closed or replaced mid-read.
+        Raw mode bypasses the framer entirely (REQ-0004 §3.2).
         """
         with self._session_lock:
             if session.generation != self._generation:
+                return
+            if self._raw_mode:
+                session.raw_queue.put(data)
                 return
             for event in session.framer.feed(data):
                 session.received_queue.put(event)

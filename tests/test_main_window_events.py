@@ -35,6 +35,7 @@ class FakeController:
     def __init__(self):
         self.received_queue = queue.Queue()
         self.diagnostic_queue = queue.Queue()
+        self.raw_queue = queue.Queue()
         self.error_queue = queue.Queue()
 
     def list_ports(self):
@@ -49,10 +50,14 @@ class FakeController:
     def write(self, data):
         pass
 
+    def set_raw_mode(self, enabled):
+        pass
+
     def reset_receive_session(self):
         """模拟真实控制器：清空时替换队列并丢弃待处理旧事件（REQ §10.1）。"""
         self.received_queue = queue.Queue()
         self.diagnostic_queue = queue.Queue()
+        self.raw_queue = queue.Queue()
 
 
 @pytest.fixture

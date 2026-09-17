@@ -28,9 +28,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .codec import encode_text, parse_hex_input
+from .codec import IncrementalTextDecoder, encode_text, format_hex, parse_hex_input
 from .config import BAUD_RATES, SerialSettings
 from .port_monitor import PortMonitor
+from .receive_buffer import ReceiveBuffer
 from .receive_framer import ReceivedEvent
 from .receive_log import ReceiveLogError, ReceiveLogService
 from .receive_renderer import render_events
@@ -38,6 +39,10 @@ from .serial_controller import SerialController
 
 TEXT_MODE = "文本"
 HEX_MODE = "HEX"
+
+#: 接收解析模式（REQ-0004 §3.1）：默认严格 `\r\n` 分帧，可选原始字节。
+FRAMED_MODE = "按 \\r\\n 分帧"
+RAW_MODE = "原始字节"
 
 _PARITY_ITEMS = ["N", "E", "O", "M", "S"]
 
@@ -77,6 +82,7 @@ class MainWindow(QMainWindow):
 
         self._is_open = False
         self._event_history: list[ReceivedEvent] = []
+        self._raw_history = ReceiveBuffer()
 
         self._build_ui()
         self._connect_signals()
@@ -146,6 +152,9 @@ class MainWindow(QMainWindow):
         self.send_mode_combo.addItems([TEXT_MODE, HEX_MODE])
         self.encoding_combo = QComboBox()
         self.encoding_combo.addItems(["UTF-8", "GBK"])
+        self.parse_mode_combo = QComboBox()
+        self.parse_mode_combo.setObjectName("parse_mode_combo")
+        self.parse_mode_combo.addItems([FRAMED_MODE, RAW_MODE])
         self.timestamp_checkbox = QCheckBox("时间戳")
         self.timestamp_checkbox.setObjectName("timestamp_checkbox")
         self.timestamp_checkbox.setChecked(True)
@@ -155,6 +164,7 @@ class MainWindow(QMainWindow):
         self.log_dir_button.setObjectName("log_dir_button")
         for label, widget in (
             ("接收", self.receive_mode_combo),
+            ("接收解析", self.parse_mode_combo),
             ("发送", self.send_mode_combo),
             ("编码", self.encoding_combo),
         ):
@@ -205,6 +215,7 @@ class MainWindow(QMainWindow):
         self.receive_mode_combo.currentIndexChanged.connect(self._render_history)
         self.encoding_combo.currentIndexChanged.connect(self._render_history)
         self.timestamp_checkbox.toggled.connect(self._render_history)
+        self.parse_mode_combo.currentIndexChanged.connect(self._on_parse_mode_changed)
 
         self.refresh_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
@@ -380,6 +391,19 @@ class MainWindow(QMainWindow):
             self._render_history()
             self._write_events_to_log(events)
 
+        # 原始字节通道（REQ-0004 §3.4）：两个通道的队列都取干净，避免切模式时
+        # 另一个通道的待处理数据被遗漏（它仍会进入各自的历史）。
+        raw_chunks = []
+        while True:
+            try:
+                raw_chunks.append(self.raw_queue.get_nowait())
+            except queue.Empty:
+                break
+        if raw_chunks:
+            for chunk in raw_chunks:
+                self._raw_history.append(chunk)
+            self._render_history()
+
         # 分帧诊断（超长帧）独立队列；控制器契约保证该队列存在（REQ-0003 §5.1.6）。
         diagnostic_queue = self.controller.diagnostic_queue
         diagnostics = []
@@ -421,6 +445,10 @@ class MainWindow(QMainWindow):
         return self.controller.received_queue
 
     @property
+    def raw_queue(self):
+        return self.controller.raw_queue
+
+    @property
     def error_queue(self):
         return self.controller.error_queue
 
@@ -430,17 +458,41 @@ class MainWindow(QMainWindow):
         sb = edit.verticalScrollBar()
         sb.setValue(sb.maximum())
 
+    def _on_parse_mode_changed(self) -> None:
+        """切换接收解析模式：通知控制器、同步时间戳控件、按新模式重渲（§3.3）。
+
+        已积累的两种历史都不清空；切换只影响后续数据如何进入链路。
+        """
+        raw_mode = self.parse_mode_combo.currentText() == RAW_MODE
+        self.controller.set_raw_mode(raw_mode)
+        self.timestamp_checkbox.setEnabled(not raw_mode)
+        self._render_history()
+
     def _render_history(self) -> None:
-        """用当前显示模式/编码/时间戳开关重渲全部事件历史。"""
+        """用当前显示模式/编码/时间戳开关重渲当前解析模式的历史。"""
         mode = "hex" if self.receive_mode_combo.currentText() == HEX_MODE else "text"
-        text = render_events(
-            self._event_history,
-            mode,
-            self._current_encoding(),
-            self.timestamp_checkbox.isChecked(),
-        )
+        encoding = self._current_encoding()
+        if self.parse_mode_combo.currentText() == RAW_MODE:
+            text = self._render_raw_history(mode, encoding)
+        else:
+            text = render_events(
+                self._event_history,
+                mode,
+                encoding,
+                self.timestamp_checkbox.isChecked(),
+            )
         self.display_edit.setPlainText(text)
         self._scroll_to_end(self.display_edit)
+
+    def _render_raw_history(self, mode: str, encoding: str) -> str:
+        """原始字节模式：整段字节流按当前模式渲染，不分帧、不加时间戳（§3.2）。
+
+        文本模式重放全部历史但不 flush，使尾部残缺的多字节序列保持待定，
+        不会提前输出替换字符。
+        """
+        if mode == "hex":
+            return self._raw_history.render("hex", encoding)
+        return IncrementalTextDecoder(encoding).decode(self._raw_history.raw())
 
     def _handle_error(self, err) -> None:
         if not self._is_open:
@@ -470,6 +522,7 @@ class MainWindow(QMainWindow):
         # 尚未 drain 的旧事件。未打开时也安全，不会创建串口连接。
         self.controller.reset_receive_session()
         self._event_history.clear()
+        self._raw_history.clear()
         self.receive_error_label.clear()
         self.display_edit.clear()
 

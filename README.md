@@ -2,7 +2,7 @@
 
 派蒙助手是一个面向 Windows 的极简串口调试上位机。它通过串口接收设备数据并实时显示原始内容，同时支持发送文本或 HEX 数据。
 
-当前版本：`v0.3.0`。
+当前版本：`v0.4.0`。
 
 完整操作步骤见 [docs/user-manual.md](docs/user-manual.md)。
 按功能独立管理的需求文档见 [docs/requirements/index.md](docs/requirements/index.md)。
@@ -18,7 +18,8 @@
 - 数据位、校验位、停止位可配置，默认 8N1
 - 接收区支持文本和 HEX 两种显示模式
 - 文本编码支持 UTF-8 和 GBK
-- 以连续 `\r\n`（`0D 0A`）作为唯一帧结束边界分帧；单独的 `\r`、单独的 `\n` 和 `\r\r\n` 按严格边界规则处理
+- 接收解析可选“按 `\r\n` 分帧”（默认）或“原始字节”：原始字节模式下数据到达即显示，不做分帧、不写 `RX` 日志，适合调试未知协议
+- 分帧模式下以连续 `\r\n`（`0D 0A`）作为唯一帧结束边界；单独的 `\r`、单独的 `\n` 和 `\r\r\n` 按严格边界规则处理
 - 每个完整数据帧生成一个接收事件，并在识别到结束边界时记录本地时间戳（`HH:mm:ss.SSS`）
 - 提供“时间戳”显示开关，默认开启；关闭只影响显示，不影响接收与日志
 - 无论时间戳开关状态如何，完整接收事件都按本地日期写入 `%LOCALAPPDATA%\PaimonAssistant\logs\YYYY-MM-DD.txt`
@@ -67,7 +68,17 @@ $env:QT_QPA_PLATFORM = "offscreen"
 Remove-Item Env:QT_QPA_PLATFORM
 ```
 
-测试重点包括配置校验、UTF-8/GBK 解码、HEX 解析、串口 reader 生命周期、会话隔离、严格 `\r\n` 分帧与超长帧处理、接收事件渲染、日志格式与 30 日保留清理、日志故障隔离、清空边界、主窗口收发、热插拔差量与去抖策略和入口冒烟。自动化测试当前结果为 `303 passed, 1 skipped`（跳过的用例需要创建符号链接的特权，无权限的平台自动跳过）。测试通过会话级环境隔离保证不会写入真实的 `%LOCALAPPDATA%\PaimonAssistant\logs\`。
+测试重点包括配置校验、UTF-8/GBK 解码、HEX 解析、串口 reader 生命周期、会话隔离、严格 `\r\n` 分帧与超长帧处理、接收事件渲染、接收解析模式切换、日志格式与 30 日保留清理、日志故障隔离、清空边界、主窗口收发、热插拔差量与去抖策略和入口冒烟。自动化测试当前结果为 `330 passed, 6 skipped`（跳过项为需要创建符号链接特权的用例和默认跳过的真实串口验收）。测试通过会话级环境隔离保证不会写入真实的 `%LOCALAPPDATA%\PaimonAssistant\logs\`。
+
+真实 com0com 端到端验收默认跳过，可显式执行：
+
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+$env:PAIMON_COM0COM_E2E = "1"
+.venv\Scripts\python.exe -m pytest tests/test_manual_com0com_e2e.py -q
+```
+
+端口可用 `PAIMON_E2E_WINDOW_PORT` / `PAIMON_E2E_PEER_PORT` 覆盖（默认 `COM17` / `COM19`）。
 
 ## 打包
 
@@ -108,6 +119,7 @@ Remove-Item Env:QT_QPA_PLATFORM
 ## 已知边界
 
 - 接收端只按 `\r\n` 识别数据帧边界，不解析载荷内部的业务字段，不识别帧头、长度、命令字、校验和、JSON、Modbus 等协议字段。
+- “按 `\r\n` 分帧”模式下，没有结束符的数据不会显示也不会写日志；调试未知协议时请切到“原始字节”模式。
 - 接收历史保存在内存中，长时间高流量运行会持续增加内存占用；清空按钮可主动释放历史内容。
 - 本期不持久化串口配置。
 - com0com 属于外部测试环境，不是应用运行时依赖。

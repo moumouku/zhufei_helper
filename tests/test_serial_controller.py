@@ -819,3 +819,118 @@ def test_close_discards_overflow_state_before_reopen():
 def test_close_before_open_is_a_noop(controller):
     controller.close()  # must not raise
     assert not controller.is_open
+
+
+# ---------------------------------------------------------------------------
+# REQ-0004: 接收解析模式（raw_queue / set_raw_mode）
+# ---------------------------------------------------------------------------
+
+class TestRawMode:
+    """REQ-0004 §3.4：原始字节模式走独立队列，不生成事件、不分帧。"""
+
+    def test_default_is_framed_so_raw_queue_stays_empty(self, controller, factory):
+        factory.seed = {"read_data": b"A\r\n"}
+        controller.open(make_settings())
+
+        events = collect_events(controller.received_queue, 1)
+
+        assert [e.raw_frame for e in events] == [b"A\r\n"]
+        assert controller.raw_queue.empty()
+        controller.close()
+
+    def test_raw_mode_publishes_read_chunks_verbatim(self, controller, factory):
+        controller.set_raw_mode(True)
+        factory.seed = {"read_chunks": [b"hel", b"lo"]}
+        controller.open(make_settings())
+
+        assert wait_until(lambda: controller.raw_queue.qsize() >= 2)
+
+        assert [controller.raw_queue.get(timeout=1.0) for _ in range(2)] == [b"hel", b"lo"]
+        # 不分帧：没有结束符也不产生任何事件，也不产生超长帧诊断
+        assert controller.received_queue.empty()
+        assert controller.diagnostic_queue.empty()
+        controller.close()
+
+    def test_switching_back_to_framed_mode_resumes_events(self, port_lister):
+        gated = GatedFactory([[b"raw", b"B\r\n"]])
+        controller = SerialController(serial_factory=gated, port_lister=port_lister)
+        controller.set_raw_mode(True)
+        ser = None
+        try:
+            controller.open(make_settings())
+            ser = gated.instances[0]
+            assert wait_until(lambda: ser.read_starts >= 1)
+            ser.release()
+            assert wait_until(lambda: not controller.raw_queue.empty())
+            assert controller.raw_queue.get(timeout=1.0) == b"raw"
+
+            controller.set_raw_mode(False)
+
+            assert wait_until(lambda: ser.read_starts >= 2)
+            ser.release()
+            events = collect_events(controller.received_queue, 1)
+            assert [e.raw_frame for e in events] == [b"B\r\n"]
+            assert controller.raw_queue.empty()
+        finally:
+            if ser is not None:
+                ser.release()
+            controller.close()
+
+    def test_mode_change_resets_the_unfinished_tail(self, port_lister):
+        # 分帧模式先收到 "A\r"（尾部未完成），切到原始字节再切回分帧，
+        # 后续数据不得与该尾部拼成事件（REQ-0004 §3.3.1）。
+        # 若尾部未被重置，"B\r\n" 会拼成 payload "A\rB"；重置后应为 "B"。
+        gated = GatedFactory([[b"A\r", b"B\r\n"]])
+        controller = SerialController(serial_factory=gated, port_lister=port_lister)
+        ser = None
+        try:
+            controller.open(make_settings())
+            ser = gated.instances[0]
+            assert wait_until(lambda: ser.read_starts >= 1)
+            ser.release()  # -> b"A\r"，成为未完成尾部
+            assert wait_until(lambda: ser.read_starts >= 2), "第一块未被分帧处理完"
+            assert controller.received_queue.empty()
+
+            controller.set_raw_mode(True)
+            controller.set_raw_mode(False)
+
+            ser.release()  # -> b"B\r\n"
+            events = collect_events(controller.received_queue, 1)
+
+            assert [e.raw_frame for e in events] == [b"B\r\n"], "切模式前的尾部泄漏进了新事件"
+        finally:
+            if ser is not None:
+                ser.release()
+            controller.close()
+
+    def test_raw_mode_survives_reopen(self, factory, port_lister):
+        controller = SerialController(serial_factory=factory, port_lister=port_lister)
+        controller.set_raw_mode(True)  # 未打开时设置也必须安全
+        factory.seed = {"read_chunks": [b"hello"]}
+        controller.open(make_settings())
+
+        assert wait_until(lambda: not controller.raw_queue.empty())
+        assert controller.raw_queue.get(timeout=1.0) == b"hello"
+        assert controller.received_queue.empty()
+        assert controller.raw_mode is True
+        controller.close()
+
+    def test_set_raw_mode_while_closed_is_safe(self, controller):
+        controller.set_raw_mode(True)
+        controller.set_raw_mode(False)
+
+        assert not controller.is_open
+
+    def test_reset_receive_session_replaces_and_clears_raw_queue(self, controller, factory):
+        controller.set_raw_mode(True)
+        factory.seed = {"read_chunks": [b"abc"]}
+        controller.open(make_settings())
+        assert wait_until(lambda: not controller.raw_queue.empty())
+        old_queue = controller.raw_queue
+
+        controller.reset_receive_session()
+
+        assert controller.raw_queue is not old_queue
+        assert controller.raw_queue.empty()
+        assert old_queue.empty()
+        controller.close()

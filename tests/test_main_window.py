@@ -65,6 +65,7 @@ class FakeController:
         self.ports = list(ports)
         self.received_queue = queue.Queue()
         self.diagnostic_queue = queue.Queue()
+        self.raw_queue = queue.Queue()
         self.error_queue = queue.Queue()
         self.opened_settings = []  # 每次 open 收到的 SerialSettings
         self.close_calls = 0
@@ -89,11 +90,15 @@ class FakeController:
     def write(self, data: bytes):
         self.writes.append(bytes(data))
 
+    def set_raw_mode(self, enabled):
+        pass
+
     def reset_receive_session(self):
         """模拟真实控制器：递增代次并按新队列丢弃待处理旧事件（REQ §10.1）。"""
         self.reset_calls += 1
         self.received_queue = queue.Queue()
         self.diagnostic_queue = queue.Queue()
+        self.raw_queue = queue.Queue()
 
 
 @pytest.fixture
