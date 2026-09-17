@@ -9,6 +9,7 @@ by diff (add/remove only), sharing one path with the manual refresh button.
 
 from __future__ import annotations
 
+import os
 import queue
 
 from PySide6.QtCore import QTimer
@@ -31,6 +32,7 @@ from .codec import encode_text, parse_hex_input
 from .config import BAUD_RATES, SerialSettings
 from .port_monitor import PortMonitor
 from .receive_framer import ReceivedEvent
+from .receive_log import ReceiveLogError, ReceiveLogService
 from .receive_renderer import render_events
 from .serial_controller import SerialController
 
@@ -40,13 +42,27 @@ HEX_MODE = "HEX"
 _PARITY_ITEMS = ["N", "E", "O", "M", "S"]
 
 
+def _default_log_dir_opener(log_dir) -> None:
+    """用 Windows 资源管理器打开日志目录（os.startfile 仅 Windows 提供）。"""
+    os.startfile(str(log_dir))
+
+
 class MainWindow(QMainWindow):
     """极简串口助手主窗口：枚举/打开/关闭/收发/清空。"""
 
-    def __init__(self, controller=None, parent=None) -> None:
+    def __init__(
+        self, controller=None, parent=None, *, log_service=None, log_dir_opener=None
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("派蒙助手")
         self.controller = controller if controller is not None else SerialController()
+        self._log_service = (
+            log_service if log_service is not None else ReceiveLogService()
+        )
+        self._log_dir_opener = (
+            log_dir_opener if log_dir_opener is not None else _default_log_dir_opener
+        )
+        self._log_error_shown = False
 
         # 端口列表监测：与轮询/手动刷新共用同一差量更新路径
         self._monitor = PortMonitor(
@@ -132,6 +148,8 @@ class MainWindow(QMainWindow):
         self.timestamp_checkbox.setChecked(True)
         self.open_button = QPushButton("打开")
         self.clear_button = QPushButton("清空")
+        self.log_dir_button = QPushButton("日志目录")
+        self.log_dir_button.setObjectName("log_dir_button")
         for label, widget in (
             ("接收", self.receive_mode_combo),
             ("发送", self.send_mode_combo),
@@ -142,6 +160,7 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.open_button)
         row2.addWidget(self.timestamp_checkbox)
         row2.addWidget(self.clear_button)
+        row2.addWidget(self.log_dir_button)
         row2.addStretch(1)
         root.addLayout(row2)
 
@@ -150,6 +169,12 @@ class MainWindow(QMainWindow):
         self.receive_error_label.setObjectName("receive_error_label")
         self.receive_error_label.setStyleSheet("color: red")
         root.addWidget(self.receive_error_label)
+
+        # 日志错误提示（红色、非模态，默认空文本）
+        self.log_error_label = QLabel("")
+        self.log_error_label.setObjectName("log_error_label")
+        self.log_error_label.setStyleSheet("color: red")
+        root.addWidget(self.log_error_label)
 
         # 第三行：滚动显示区
         self.display_edit = QPlainTextEdit()
@@ -171,6 +196,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.clicked.connect(self._refresh_ports)
         self.open_button.clicked.connect(self._on_open_clicked)
         self.clear_button.clicked.connect(self._on_clear)
+        self.log_dir_button.clicked.connect(self._on_log_dir_clicked)
         self.send_button.clicked.connect(self._on_send_clicked)
         self.send_edit.returnPressed.connect(self._on_send_clicked)
         self.receive_mode_combo.currentIndexChanged.connect(self._render_history)
@@ -332,7 +358,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- receive
 
     def _drain_queues(self) -> None:
-        """批量取出接收事件/错误；事件进历史后按当前设置重渲显示。"""
+        """批量取出接收事件/分帧诊断/串口错误。
+
+        事件先进历史并按当前设置重渲显示，再按同一顺序写入日志；
+        诊断显示到 ``receive_error_label``，串口错误沿用关闭+弹窗路径。
+        """
         received_queue = self.received_queue
         error_queue = self.error_queue
 
@@ -345,6 +375,19 @@ class MainWindow(QMainWindow):
         if events:
             self._event_history.extend(events)
             self._render_history()
+            self._write_events_to_log(events)
+
+        # 分帧诊断（超长帧）独立队列；旧 controller 未提供时跳过。
+        diagnostic_queue = getattr(self.controller, "diagnostic_queue", None)
+        if diagnostic_queue is not None:
+            diagnostics = []
+            while True:
+                try:
+                    diagnostics.append(diagnostic_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if diagnostics:
+                self.receive_error_label.setText(str(diagnostics[-1]))
 
         errors = []
         while True:
@@ -354,6 +397,22 @@ class MainWindow(QMainWindow):
                 break
         if errors:
             self._handle_error(errors[-1])
+
+    def _write_events_to_log(self, events) -> None:
+        """显示完成后，按事件顺序逐条交给日志服务（每个事件最多一次）。
+
+        首次失败（抛 ``ReceiveLogError`` 或熔断后返回 ``False``）在
+        ``log_error_label`` 显示固定提示；之后不重复提示、不缓存、不重试。
+        """
+        for event in events:
+            try:
+                written = self._log_service.write_event(event)
+            except ReceiveLogError:
+                written = False
+            if written or self._log_error_shown:
+                continue
+            self._log_error_shown = True
+            self.log_error_label.setText("日志写入失败，请检查磁盘空间或权限")
 
     @property
     def received_queue(self):
@@ -387,6 +446,19 @@ class MainWindow(QMainWindow):
         message = err if isinstance(err, str) else str(err)
         self._close_connection()
         QMessageBox.critical(self, "串口错误", message)
+
+    # --------------------------------------------------------- log entry
+
+    def _on_log_dir_clicked(self) -> None:
+        """先确保日志目录存在，再用注入的打开器打开目录本身。
+
+        创建或打开失败只更新错误标签，不影响接收链路与串口连接。
+        """
+        try:
+            self._log_service.ensure_directory()
+            self._log_dir_opener(self._log_service.log_dir)
+        except Exception as exc:
+            self.log_error_label.setText(f"日志目录打开失败：{exc}")
 
     # --------------------------------------------------------------- clear
 
