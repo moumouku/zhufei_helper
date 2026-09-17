@@ -49,12 +49,14 @@ E:\projects_learning\zhufei_helps\dist\PaimonAssistant.exe
 
 ### 4.1 端口
 
-“端口”下拉框显示系统当前检测到的 COM 口，例如：
+“端口”下拉框显示系统当前检测到的 COM 口。当前开发环境的 com0com 配对口为：
 
 ```text
-COM3
-COM4
+COM17
+COM19
 ```
+
+端口号由 Windows/com0com 分配，其他环境可能不同；`COM3`、`COM4` 仅作为早期示例。
 
 如果列表为空，需要先连接设备，或者安装并创建虚拟串口。当前选择有效时，新插入端口不会改变选择；当前选择为空或已失效时，会自动选择本次枚举顺序中的第一个新端口。拔出未选中的端口会静默移除；拔出已选中但未连接的端口后，选择会留空，不会自动补选其他端口。
 
@@ -250,48 +252,50 @@ HEX 模式下不能使用 `0x` 前缀，每个字节必须正好是两位十六�
 
 ## 8. 虚拟串口联调
 
-没有真实设备时，可以使用 com0com 创建一对虚拟串口，例如：
+没有真实设备时，可以使用 com0com 创建一对虚拟串口。当前开发环境使用：
 
 ```text
-COM3 <-> COM4
+COM17 <-> COM19
 ```
+
+端口号由 Windows/com0com 分配，其他环境可能不同；`COM3 <-> COM4` 仅作为下载 com0com 前的示例。
 
 ### 8.1 创建端口
 
-安装 com0com 后，以管理员身份打开 com0com 的命令行工具，创建端口对：
+安装 com0com 后，以管理员身份打开 com0com 的命令行工具，创建端口对。当前环境对应的命令为：
 
 ```text
-install PortName=COM3 PortName=COM4
+install PortName=COM17 PortName=COM19
 ```
 
 不同 com0com 版本的命令行界面可能略有差异，以安装目录中的 `setupc.exe` 帮助为准。
 
-### 8.2 使用派蒙助手连接 COM3
+### 8.2 使用派蒙助手连接 COM17
 
 1. 启动派蒙助手。
 2. 点击“刷新”。
-3. 选择 `COM3`。
+3. 选择 `COM17`。
 4. 设置 `115200 / 8 / N / 1`。
 5. 点击“打开”。
 
-### 8.3 使用 COM4 另一端测试
+### 8.3 使用 COM19 另一端测试
 
-可以使用 pyserial 自带的终端工具连接 COM4：
+可以使用 pyserial 自带的终端工具连接 COM19：
 
 ```powershell
 cd E:\projects_learning\zhufei_helps
-.venv\Scripts\python.exe -m serial.tools.miniterm COM4 115200
+.venv\Scripts\python.exe -m serial.tools.miniterm COM19 115200
 ```
 
-从 COM4 输入文本，派蒙助手应收到对应数据。也可以从派蒙助手发送数据，观察 COM4 终端是否收到。
+从 COM19 输入文本，派蒙助手应收到对应数据。也可以从派蒙助手发送数据，观察 COM19 终端是否收到。
 
 ### 8.4 精确发送测试字节
 
-下面的命令从 COM4 发送 UTF-8 字符串：
+下面的命令从 COM19 发送 UTF-8 字符串：
 
 ```powershell
 cd E:\projects_learning\zhufei_helps
-.venv\Scripts\python.exe -c "import serial; s=serial.Serial('COM4',115200); s.write('你好'.encode('utf-8')); s.close()"
+.venv\Scripts\python.exe -c "import serial; s=serial.Serial('COM19',115200); s.write('你好'.encode('utf-8')); s.close()"
 ```
 
 派蒙助手在 UTF-8 文本模式下应显示：
@@ -310,10 +314,10 @@ E4 BD A0 E5 A5 BD
 
 可以用以下方式检查错误提示：
 
-- 用另一个程序先打开 COM3，再在派蒙助手中尝试打开 COM3。
+- 用另一个程序先打开 COM17，再在派蒙助手中尝试打开 COM17。
 - 启动两个派蒙助手实例，让它们竞争同一个 COM 口。
 - 设备或虚拟串口断开后继续发送数据。
-- 保持派蒙助手连接 COM3，使 COM3 短暂消失后在一次轮询内恢复，确认不会误关闭；连续两次轮询仍消失时，确认自动关闭并提示“串口已拔出，连接已关闭”。
+- 保持派蒙助手连接 COM17，使 COM17 短暂消失后在一次轮询内恢复，确认不会误关闭；连续两次轮询仍消失时，确认自动关闭并提示“串口已拔出，连接已关闭”。
 - 拔除未选中的端口，确认静默移除；拔除已选中但未连接的端口，确认选择留空且不会自动打开其他端口。
 - 在 HEX 发送模式输入非法字符。
 
