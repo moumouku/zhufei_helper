@@ -1,8 +1,8 @@
 """PySide6 main window for Paimon Assistant.
 
-Received bytes are drained from the controller in timed batches. Text mode
-uses an incremental decoder and HEX mode formats only newly arrived bytes;
-the complete raw history is re-rendered only when mode or encoding changes.
+Complete RX events are drained from the controller in timed batches and kept in
+an in-memory history; the display is rendered from that history with the current
+mode / encoding / timestamp settings.
 Ports are polled every second via PortMonitor and the combo box is updated
 by diff (add/remove only), sharing one path with the manual refresh button.
 """
@@ -12,8 +12,8 @@ from __future__ import annotations
 import queue
 
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -27,10 +27,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .codec import IncrementalTextDecoder, encode_text, format_hex, parse_hex_input
+from .codec import encode_text, parse_hex_input
 from .config import BAUD_RATES, SerialSettings
 from .port_monitor import PortMonitor
-from .receive_buffer import ReceiveBuffer
+from .receive_framer import ReceivedEvent
+from .receive_renderer import render_events
 from .serial_controller import SerialController
 
 TEXT_MODE = "文本"
@@ -56,14 +57,10 @@ class MainWindow(QMainWindow):
         )
 
         self._is_open = False
-        self._receive_buffer = ReceiveBuffer()
-        self._hex_has_content = False  # 显示区已有 HEX 内容（决定追加时的空格）
+        self._event_history: list[ReceivedEvent] = []
 
         self._build_ui()
         self._connect_signals()
-
-        # 增量解码器：只对“新到达字节”解码，避免每次全量重渲染
-        self._decoder = IncrementalTextDecoder(self._current_encoding())
 
         self._timer = QTimer(self)
         self._timer.setInterval(50)
@@ -130,6 +127,9 @@ class MainWindow(QMainWindow):
         self.send_mode_combo.addItems([TEXT_MODE, HEX_MODE])
         self.encoding_combo = QComboBox()
         self.encoding_combo.addItems(["UTF-8", "GBK"])
+        self.timestamp_checkbox = QCheckBox("时间戳")
+        self.timestamp_checkbox.setObjectName("timestamp_checkbox")
+        self.timestamp_checkbox.setChecked(True)
         self.open_button = QPushButton("打开")
         self.clear_button = QPushButton("清空")
         for label, widget in (
@@ -140,9 +140,16 @@ class MainWindow(QMainWindow):
             row2.addWidget(QLabel(label))
             row2.addWidget(widget)
         row2.addWidget(self.open_button)
+        row2.addWidget(self.timestamp_checkbox)
         row2.addWidget(self.clear_button)
         row2.addStretch(1)
         root.addLayout(row2)
+
+        # 接收区上方：分帧诊断提示（红色、非模态，默认空文本）
+        self.receive_error_label = QLabel("")
+        self.receive_error_label.setObjectName("receive_error_label")
+        self.receive_error_label.setStyleSheet("color: red")
+        root.addWidget(self.receive_error_label)
 
         # 第三行：滚动显示区
         self.display_edit = QPlainTextEdit()
@@ -166,8 +173,9 @@ class MainWindow(QMainWindow):
         self.clear_button.clicked.connect(self._on_clear)
         self.send_button.clicked.connect(self._on_send_clicked)
         self.send_edit.returnPressed.connect(self._on_send_clicked)
-        self.receive_mode_combo.currentIndexChanged.connect(self._re_render)
-        self.encoding_combo.currentIndexChanged.connect(self._re_render)
+        self.receive_mode_combo.currentIndexChanged.connect(self._render_history)
+        self.encoding_combo.currentIndexChanged.connect(self._render_history)
+        self.timestamp_checkbox.toggled.connect(self._render_history)
 
         self.refresh_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
@@ -324,18 +332,19 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- receive
 
     def _drain_queues(self) -> None:
-        """批量取出接收/错误队列，逐块解码追加，避免每字节刷新。"""
+        """批量取出接收事件/错误；事件进历史后按当前设置重渲显示。"""
         received_queue = self.received_queue
         error_queue = self.error_queue
 
-        chunks = []
+        events = []
         while True:
             try:
-                chunks.append(received_queue.get_nowait())
+                events.append(received_queue.get_nowait())
             except queue.Empty:
                 break
-        if chunks:
-            self._append_received(b"".join(chunks))
+        if events:
+            self._event_history.extend(events)
+            self._render_history()
 
         errors = []
         while True:
@@ -354,68 +363,23 @@ class MainWindow(QMainWindow):
     def error_queue(self):
         return self.controller.error_queue
 
-    def _append_received(self, data: bytes) -> None:
-        self._receive_buffer.append(data)
-        if self.receive_mode_combo.currentText() == TEXT_MODE:
-            text = self._decoder.decode(data)
-            if text:
-                self._append_display(text)
-        else:  # HEX：只格式化新到达字节，全量渲染仅在切换时发生
-            rendered = format_hex(data)
-            if rendered:
-                if self._hex_has_content:
-                    rendered = " " + rendered
-                self._append_display(rendered)
-                self._hex_has_content = True
-
-    def _append_display(self, text: str) -> None:
-        cursor = self.display_edit.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.display_edit.setTextCursor(cursor)
-        self.display_edit.insertPlainText(text)
-        # 追加后始终跟随末尾，保证最新接收内容可见
-        self._scroll_to_end(self.display_edit)
-
     @staticmethod
     def _scroll_to_end(edit) -> None:
         """把显示区滚动条拨到末尾（maximum 随内容同步更新）。"""
         sb = edit.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _re_render(self) -> None:
-        """模式/编码切换时全量重渲染历史（仅此时 O(n)）。
-
-        文本模式用新解码器对全部 raw 历史重放但不 flush：尾部不完整多字节
-        序列留在 decoder pending，后续新字节到达时仍能拼出完整字符；HEX
-        模式全量 format，切回文本时再从全部 raw 重建 pending。
-        """
-        mode = self.receive_mode_combo.currentText()
-        encoding = self._current_encoding()
-        try:
-            decoder = IncrementalTextDecoder(encoding)
-        except ValueError:
-            return
-        self._hex_has_content = False
-        raw = self._receive_buffer.raw()
-        # 重渲染前记录是否位于末尾：setPlainText 会把滚动条重置到顶部
-        was_at_end = self.display_edit.verticalScrollBar().maximum() > 0 and (
-            self.display_edit.verticalScrollBar().value()
-            >= self.display_edit.verticalScrollBar().maximum()
+    def _render_history(self) -> None:
+        """用当前显示模式/编码/时间戳开关重渲全部事件历史。"""
+        mode = "hex" if self.receive_mode_combo.currentText() == HEX_MODE else "text"
+        text = render_events(
+            self._event_history,
+            mode,
+            self._current_encoding(),
+            self.timestamp_checkbox.isChecked(),
         )
-        try:
-            if mode == TEXT_MODE:
-                # 重放全部历史但不 flush：截断的尾部序列保持 pending
-                text = decoder.decode(raw)
-            else:
-                text = self._receive_buffer.render("hex", encoding)
-        except ValueError:
-            return
-        self._decoder = decoder
         self.display_edit.setPlainText(text)
-        if was_at_end:
-            self._scroll_to_end(self.display_edit)
-        if mode == HEX_MODE and text:
-            self._hex_has_content = True
+        self._scroll_to_end(self.display_edit)
 
     def _handle_error(self, err) -> None:
         if not self._is_open:
@@ -427,21 +391,16 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- clear
 
     def _on_clear(self) -> None:
-        # 丢弃点击时 receive 队列中尚未被 drain 取走的旧字节，避免随后
-        # QTimer/_drain_queues 把清空前数据重新显示；只取此刻可取的项，
-        # 点击后新到达的数据不受影响。
+        # 丢弃点击时 receive 队列中尚未 drain 的旧事件，避免随后 QTimer 把
+        # 清空前的事件重新显示；点击后新到达的事件不受影响。
         received_queue = self.received_queue
         while True:
             try:
                 received_queue.get_nowait()
             except queue.Empty:
                 break
-        self._receive_buffer.clear()
-        try:
-            self._decoder = IncrementalTextDecoder(self._current_encoding())
-        except ValueError:
-            pass
-        self._hex_has_content = False
+        self._event_history.clear()
+        self.receive_error_label.clear()
         self.display_edit.clear()
 
     # --------------------------------------------------------------- send

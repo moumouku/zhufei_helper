@@ -17,6 +17,7 @@
 import importlib
 import os
 import queue
+from dataclasses import dataclass
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -38,6 +39,21 @@ PUBLIC_WIDGETS = [
     "send_mode_combo",
     "send_button",
 ]
+
+
+@dataclass(frozen=True)
+class FakeEvent:
+    """按 duck-typing 契约构造的接收事件（received_at_ms / payload / raw_frame）。"""
+
+    received_at_ms: int
+    payload: bytes
+    raw_frame: bytes
+
+
+def _event(text: str, *, encoding: str = "utf-8", ms: int = 0) -> FakeEvent:
+    """构造一个文本负载的完整事件（原始帧 = 载荷 + \\r\\n）。"""
+    payload = text.encode(encoding)
+    return FakeEvent(ms, payload, payload + b"\r\n")
 
 
 class FakeController:
@@ -407,36 +423,41 @@ def test_close_restores_state(window, controller):
 # ---------- 接收显示 ----------
 
 
-def test_drain_received_queue_shows_text(window, controller):
-    controller.received_queue.put("你好".encode("utf-8"))
-    controller.received_queue.put(b" world")
+def test_drain_received_queue_shows_event_text(window, controller):
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(_event("你好"))
+    controller.received_queue.put(_event("world"))
     window._drain_queues()
-    assert window.display_edit.toPlainText() == "你好 world"
+    assert window.display_edit.toPlainText() == "你好\nworld\n"
 
 
 def test_switch_to_hex_rerenders_history_uppercase_space_separated(window, controller):
-    controller.received_queue.put(b"\x01\x02\xab\xff")
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(
+        FakeEvent(0, b"\x01\x02\xab\xff", b"\x01\x02\xab\xff\r\n")
+    )
     window._drain_queues()
     _select(window.receive_mode_combo, "HEX")
-    assert window.display_edit.toPlainText() == "01 02 AB FF"
+    assert window.display_edit.toPlainText() == "01 02 AB FF 0D 0A\n"
 
 
 def test_switch_to_gbk_rerenders_history(window, controller):
-    controller.received_queue.put("你好".encode("gbk"))
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(_event("你好", encoding="gbk"))
     window._drain_queues()
     _select(window.encoding_combo, "GBK")
-    assert window.display_edit.toPlainText() == "你好"
+    assert window.display_edit.toPlainText() == "你好\n"
 
 
 # ---------- 自动滚动 ----------
 
 
 def _feed_many_lines(window, controller, count=300):
-    """把窗口缩小并追加大量带换行文本，保证内容超出视口。"""
+    """把窗口缩小并喂入大量事件，保证内容超出视口。"""
     window.resize(400, 200)
     window.show()
-    text = "".join(f"line {i}\n" for i in range(count))
-    controller.received_queue.put(text.encode("utf-8"))
+    for i in range(count):
+        controller.received_queue.put(_event(f"line {i}"))
     window._drain_queues()
 
 
@@ -522,9 +543,10 @@ def test_empty_hex_warns_and_no_write(window, controller, dialogs):
 
 
 def test_clear_clears_display_and_history(window, controller):
-    controller.received_queue.put(b"abc")
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(_event("abc"))
     window._drain_queues()
-    assert window.display_edit.toPlainText() == "abc"
+    assert window.display_edit.toPlainText() == "abc\n"
 
     window.clear_button.click()
     assert window.display_edit.toPlainText() == ""
@@ -533,10 +555,11 @@ def test_clear_clears_display_and_history(window, controller):
     assert window.display_edit.toPlainText() == ""
 
 
-def test_clear_discards_queued_bytes_not_yet_drained(window, controller):
-    """清空点击时，receive 队列中尚未被 drain 取走的旧字节必须一并丢弃。"""
+def test_clear_discards_queued_events_not_yet_drained(window, controller):
+    """清空点击时，receive 队列中尚未被 drain 取走的旧事件必须一并丢弃。"""
     window._timer.stop()  # 停掉 50ms QTimer，保证测试确定性
-    controller.received_queue.put(b"old-data")
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(_event("old-data"))
     window.clear_button.click()
     window._drain_queues()
     assert window.display_edit.toPlainText() == ""
@@ -545,22 +568,24 @@ def test_clear_discards_queued_bytes_not_yet_drained(window, controller):
 def test_clear_keeps_data_arriving_after_click(window, controller):
     """清空后新到达的数据不能被吞掉。"""
     window._timer.stop()
-    controller.received_queue.put(b"old-data")
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(_event("old-data"))
     window.clear_button.click()
-    controller.received_queue.put(b"new-data")
+    controller.received_queue.put(_event("new-data"))
     window._drain_queues()
-    assert window.display_edit.toPlainText() == "new-data"
+    assert window.display_edit.toPlainText() == "new-data\n"
 
 
-def test_clear_discards_only_old_queued_bytes(window, controller):
-    """混合场景：点击时已在队列的旧字节丢弃，点击后到达的新字节保留。"""
+def test_clear_discards_only_old_queued_events(window, controller):
+    """混合场景：点击时已在队列的旧事件丢弃，点击后到达的新事件保留。"""
     window._timer.stop()
-    controller.received_queue.put(b"old-1")
-    controller.received_queue.put(b"old-2")
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(_event("old-1"))
+    controller.received_queue.put(_event("old-2"))
     window.clear_button.click()
-    controller.received_queue.put(b"new")
+    controller.received_queue.put(_event("new"))
     window._drain_queues()
-    assert window.display_edit.toPlainText() == "new"
+    assert window.display_edit.toPlainText() == "new\n"
 
 
 def test_error_queue_shows_critical_and_restores_closed_state(window, controller, dialogs):
