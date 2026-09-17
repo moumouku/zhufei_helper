@@ -88,6 +88,11 @@ class ReceiveLogService:
         self._last_cleanup_date: Optional[date] = None
         self._broken = False
 
+    @property
+    def log_dir(self) -> Path:
+        """Resolved log directory (the "日志目录" entry opens this path)."""
+        return self._log_dir
+
     def _create_directory(self) -> None:
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
