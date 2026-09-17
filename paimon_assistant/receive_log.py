@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 import time
 from datetime import date, datetime, timedelta
 from functools import partial
@@ -87,7 +88,9 @@ class ReceiveLogService:
         opener: Optional[Callable[[Path], TextIO]] = None,
         remover: Optional[Callable[[Path], None]] = None,
     ) -> None:
-        self._log_dir = Path(log_dir) if log_dir is not None else _default_log_dir()
+        self._log_dir = (
+            Path(log_dir) if log_dir else _default_log_dir()
+        )  # 空字符串视为未指定，避免退化为当前工作目录
         self._now_ms = now_ms if now_ms is not None else _system_now_ms
         self._date_from_ms = (
             date_from_ms if date_from_ms is not None else _default_date_from_ms
@@ -137,21 +140,26 @@ class ReceiveLogService:
                 f"RX {event.raw_frame.hex(' ').upper()}"
             )
             self._create_directory()
-            self._cleanup_if_needed(write_date)
+        except Exception as exc:
+            raise self._fuse(exc) from exc
+        # 保留清理是辅助操作：失败只记日志，不得熔断本运行的日志写入（§8.8）。
+        self._cleanup_if_needed(write_date)
+        try:
             path = self._log_dir / f"{write_date.isoformat()}.txt"
             with self._opener(path) as handle:
                 handle.write(line + "\n")
                 handle.flush()
         except Exception as exc:
-            self._broken = True
-            logger.error(
-                "Receive log write failed for %s: %s",
-                self._log_dir,
-                exc,
-                exc_info=True,
-            )
-            raise ReceiveLogError(f"Receive log write failed: {exc}") from exc
+            raise self._fuse(exc) from exc
         return True
+
+    def _fuse(self, exc: Exception) -> ReceiveLogError:
+        """熔断本次运行并返回对外报告的日志故障（§7.4.2）。"""
+        self._broken = True
+        logger.error(
+            "Receive log write failed for %s: %s", self._log_dir, exc, exc_info=True
+        )
+        return ReceiveLogError(f"Receive log write failed: {exc}")
 
     def cleanup(self) -> None:
         """§8.1 启动清理：按保留规则删除过期日期日志，不创建目录。
@@ -170,19 +178,32 @@ class ReceiveLogService:
             )
 
     def _cleanup_if_needed(self, cleanup_date: date) -> None:
-        """Once per local date (startup and after midnight), drop old logs."""
+        """Once per local date (startup and after midnight), drop old logs.
+
+        清理是辅助操作：列举、检查或删除失败只记日志，不熔断本运行的日志写入
+        （§8.8）；列举失败时不标记该日期已清理，留待下一次重试。
+        """
         if cleanup_date == self._last_cleanup_date:
             return
+        try:
+            entries = list(self._log_dir.iterdir())
+        except OSError:
+            logger.exception("Receive log retention listing failed: %s", self._log_dir)
+            return
         self._last_cleanup_date = cleanup_date
-        today = self._date_from_ms(self._now_ms())
-        cutoff = today - timedelta(days=_RETENTION_DAYS)
-        for path in self._log_dir.iterdir():
+        cutoff = self._date_from_ms(self._now_ms()) - timedelta(days=_RETENTION_DAYS)
+        for path in entries:
             log_date = _log_file_date(path.name)
             if log_date is None:  # 非目标文件名（§8.3、§8.7）
                 continue
             if log_date >= cutoff:  # 保留当天及此前 30 个日历日（§8.5）
                 continue
-            if not path.is_file():  # 子目录等非普通文件（§8.3）
+            try:
+                mode = path.lstat().st_mode
+            except OSError:
+                logger.exception("Receive log retention stat failed: %s", path)
+                continue
+            if not stat.S_ISREG(mode):  # 子目录、符号链接等非普通文件（§8.3）
                 continue
             try:
                 self._remover(path)

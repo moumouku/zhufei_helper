@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -598,6 +599,197 @@ class TestFailureIsolation:
         assert opener.calls == opened_before
         assert remover.removed == removed_before
         assert dropped_in_later.exists()
+
+
+class TestCleanupFailureIsolation:
+    """审查 W1：清理阶段失败不得熔断本运行的日志写入（§7.4.2 对比 §8.8）。"""
+
+    def test_retention_listing_failure_during_write_does_not_fuse_logging(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        service = ReceiveLogService(
+            log_dir,
+            now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3)),
+        )
+        real_iterdir = Path.iterdir
+        state = {"fail": True}
+
+        def flaky_iterdir(self):
+            if self == log_dir and state["fail"]:
+                raise PermissionError("directory listing denied")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", flaky_iterdir)
+
+        with caplog.at_level(logging.ERROR):
+            written = service.write_event(event_at(datetime(2026, 5, 17, 9, 12, 3), b"A\r\n"))
+
+        assert written is True  # 清理列举失败不得熔断正常写入
+        assert log_lines(log_dir / "2026-05-17.txt") == ["[09:12:03.000] RX 41 0D 0A"]
+        assert any("listing" in record.message.lower() for record in caplog.records)
+
+    def test_retention_is_retried_after_a_listing_failure(self, tmp_path, monkeypatch):
+        log_dir = tmp_path / "logs"
+        stale = dated_file(log_dir, date(2026, 4, 1))
+        service = ReceiveLogService(
+            log_dir, now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        )
+        real_iterdir = Path.iterdir
+        state = {"fail": True}
+
+        def flaky_iterdir(self):
+            if self == log_dir and state["fail"]:
+                raise PermissionError("directory listing denied")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", flaky_iterdir)
+
+        service.cleanup()  # 失败：不得标记当天已完成清理（§8.8 留待下一次清理）
+        state["fail"] = False
+        service.cleanup()
+
+        assert not stale.exists()
+
+    def test_cleanup_listing_failure_at_startup_does_not_fuse_writes(
+        self, tmp_path, monkeypatch
+    ):
+        log_dir = tmp_path / "logs"
+        stale = dated_file(log_dir, date(2026, 4, 1))
+        opener = RecordingOpener()
+        service = ReceiveLogService(
+            log_dir,
+            now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3)),
+            opener=opener,
+        )
+        state = {"fail": True}
+        real_iterdir = Path.iterdir
+
+        def flaky_iterdir(self):
+            if self == log_dir and state["fail"]:
+                raise PermissionError("directory listing denied")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", flaky_iterdir)
+
+        service.cleanup()
+        state["fail"] = False
+
+        assert service.write_event(event_at(datetime(2026, 5, 17, 9, 12, 3), b"A\r\n")) is True
+        assert not stale.exists()  # 启动清理失败后，首次写入仍会重新清理
+
+    def test_cleanup_skips_when_the_log_path_is_a_regular_file(self, tmp_path):
+        log_path = tmp_path / "logs"
+        log_path.write_text("not a directory", encoding="utf-8")
+        service = ReceiveLogService(
+            log_path, now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        )
+
+        service.cleanup()  # 不抛异常，也不把该文件当目录处理
+
+        assert log_path.read_text(encoding="utf-8") == "not a directory"
+
+
+class TestRetentionTargets:
+    """§8.3 只处理日志目录中名称严格匹配 ``YYYY-MM-DD.txt`` 的普通文件。"""
+
+    def test_retention_skips_symlinked_date_files(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        target = tmp_path / "target.txt"
+        target.write_text("keep", encoding="utf-8")
+        link = log_dir / "2026-04-01.txt"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation is not permitted on this platform")
+        service = ReceiveLogService(
+            log_dir, now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        )
+
+        service.cleanup()
+
+        assert link.is_symlink(), "符号链接不是普通文件，不得作为清理目标"
+        assert target.read_text(encoding="utf-8") == "keep"
+
+    def test_retention_skips_non_regular_date_entries_without_symlink_privilege(
+        self, tmp_path, monkeypatch
+    ):
+        """上面那条需要创建链接的特权；这里用可控的 lstat 固定同一分支。"""
+        log_dir = tmp_path / "logs"
+        stale = dated_file(log_dir, date(2026, 4, 1))
+        remover = RecordingRemover()
+        service = ReceiveLogService(
+            log_dir,
+            now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3)),
+            remover=remover,
+        )
+        real_lstat = Path.lstat
+        link_mode = stat.S_IFLNK | 0o777
+
+        def fake_lstat(self):
+            if self == stale:
+                return os.stat_result((link_mode, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            return real_lstat(self)
+
+        monkeypatch.setattr(Path, "lstat", fake_lstat)
+
+        service.cleanup()
+
+        assert remover.removed == []
+        assert stale.exists()
+
+
+class TestEmptyLogDirArgument:
+    def test_empty_string_falls_back_to_the_default_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        service = ReceiveLogService(
+            "", now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        )
+
+        assert service.log_dir == tmp_path / "local" / "PaimonAssistant" / "logs"
+
+
+class TestMidnightAndSubSecondBoundaries:
+    def test_late_event_for_the_previous_day_does_not_consume_the_new_day_cleanup(
+        self, tmp_path
+    ):
+        log_dir = tmp_path / "logs"
+        clock = FakeClock(datetime(2026, 5, 17, 23, 59, 30))
+        service = ReceiveLogService(log_dir, now_ms=clock)
+        service.cleanup()  # 标记 2026-05-17 已清理
+
+        clock.at = datetime(2026, 5, 18, 0, 0, 1)
+        service.write_event(
+            event_at(datetime(2026, 5, 17, 23, 59, 59), b"late\r\n")
+        )
+        stale = dated_file(log_dir, date(2026, 4, 1))
+        service.write_event(event_at(datetime(2026, 5, 18, 0, 0, 2), b"new\r\n"))
+
+        assert log_lines(log_dir / "2026-05-17.txt") == ["[23:59:59.000] RX 6C 61 74 65 0D 0A"]
+        assert not stale.exists()
+
+    def test_sub_second_boundary_events_use_their_own_local_date(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        service = ReceiveLogService(
+            log_dir, now_ms=FakeClock(datetime(2026, 5, 18, 12, 0, 0))
+        )
+        last_second = int(datetime(2026, 5, 17, 23, 59, 59).timestamp() * 1000)
+
+        service.write_event(
+            SimpleNamespace(
+                received_at_ms=last_second + 999, payload=b"", raw_frame=b"A\r\n"
+            )
+        )
+        service.write_event(
+            SimpleNamespace(
+                received_at_ms=last_second + 1000, payload=b"", raw_frame=b"B\r\n"
+            )
+        )
+
+        assert log_lines(log_dir / "2026-05-17.txt") == ["[23:59:59.999] RX 41 0D 0A"]
+        assert log_lines(log_dir / "2026-05-18.txt") == ["[00:00:00.000] RX 42 0D 0A"]
 
 
 class TestDefaultLogDirectory:
