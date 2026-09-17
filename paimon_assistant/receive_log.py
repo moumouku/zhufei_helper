@@ -56,6 +56,11 @@ def _default_log_dir() -> Path:
     return Path(local_app_data) / "PaimonAssistant" / "logs"
 
 
+def _default_date_from_ms(ms: int) -> date:
+    """本地时区下某个 epoch 毫秒时刻对应的日历日期（§7.1.3）。"""
+    return datetime.fromtimestamp(ms // 1000).date()
+
+
 def _log_file_date(name: str) -> Optional[date]:
     """Date encoded in a strictly named ``YYYY-MM-DD.txt`` file, else ``None``."""
     if _LOG_FILE_NAME.fullmatch(name) is None:
@@ -78,11 +83,15 @@ class ReceiveLogService:
         log_dir: Optional[Union[str, Path]] = None,
         *,
         now_ms: Optional[Callable[[], int]] = None,
+        date_from_ms: Optional[Callable[[int], date]] = None,
         opener: Optional[Callable[[Path], TextIO]] = None,
         remover: Optional[Callable[[Path], None]] = None,
     ) -> None:
         self._log_dir = Path(log_dir) if log_dir is not None else _default_log_dir()
         self._now_ms = now_ms if now_ms is not None else _system_now_ms
+        self._date_from_ms = (
+            date_from_ms if date_from_ms is not None else _default_date_from_ms
+        )
         self._opener = opener if opener is not None else _open_append
         self._remover = remover if remover is not None else os.remove
         self._last_cleanup_date: Optional[date] = None
@@ -113,25 +122,27 @@ class ReceiveLogService:
 
         After the first failure of this run the service is fused: later calls
         return ``False`` without touching the filesystem, buffering the event
-        or retrying anything (§7.4.3).
+        or retrying anything (§7.4.3). 日志写入路径上的任何失败（含非
+        ``OSError``）都归一为 ``ReceiveLogError`` 并熔断，避免日志故障穿透
+        到串口核心链路（§7.3.8）。
         """
         if self._broken:
             return False
-        seconds, millis = divmod(event.received_at_ms, 1000)
-        received = datetime.fromtimestamp(seconds)
-        write_date = received.date()
-        line = (
-            f"[{received:%H:%M:%S}.{millis:03d}] "
-            f"RX {event.raw_frame.hex(' ').upper()}"
-        )
         try:
+            seconds, millis = divmod(event.received_at_ms, 1000)
+            received = datetime.fromtimestamp(seconds)
+            write_date = self._date_from_ms(event.received_at_ms)
+            line = (
+                f"[{received:%H:%M:%S}.{millis:03d}] "
+                f"RX {event.raw_frame.hex(' ').upper()}"
+            )
             self._create_directory()
             self._cleanup_if_needed(write_date)
             path = self._log_dir / f"{write_date.isoformat()}.txt"
             with self._opener(path) as handle:
                 handle.write(line + "\n")
                 handle.flush()
-        except OSError as exc:
+        except Exception as exc:
             self._broken = True
             logger.error(
                 "Receive log write failed for %s: %s",
@@ -142,12 +153,28 @@ class ReceiveLogService:
             raise ReceiveLogError(f"Receive log write failed: {exc}") from exc
         return True
 
-    def _cleanup_if_needed(self, write_date: date) -> None:
+    def cleanup(self) -> None:
+        """§8.1 启动清理：按保留规则删除过期日期日志，不创建目录。
+
+        启动清理是辅助操作：目录不存在视为无文件可清理；清理失败只记日志，
+        绝不向调用方抛出，以免影响应用启动。
+        """
+        try:
+            if not self._log_dir.is_dir():
+                return
+            today = self._date_from_ms(self._now_ms())
+            self._cleanup_if_needed(today)
+        except Exception as exc:
+            logger.exception(
+                "Receive log startup cleanup failed for %s: %s", self._log_dir, exc
+            )
+
+    def _cleanup_if_needed(self, cleanup_date: date) -> None:
         """Once per local date (startup and after midnight), drop old logs."""
-        if write_date == self._last_cleanup_date:
+        if cleanup_date == self._last_cleanup_date:
             return
-        self._last_cleanup_date = write_date
-        today = datetime.fromtimestamp(self._now_ms() // 1000).date()
+        self._last_cleanup_date = cleanup_date
+        today = self._date_from_ms(self._now_ms())
         cutoff = today - timedelta(days=_RETENTION_DAYS)
         for path in self._log_dir.iterdir():
             log_date = _log_file_date(path.name)

@@ -247,6 +247,33 @@ class TestRetention:
         assert future.exists()
         assert not drop.exists()
 
+    @pytest.mark.parametrize(
+        "today, keep_day, drop_day",
+        [
+            # 跨年：2026-01-05 的截止日为 2025-12-06
+            (date(2026, 1, 5), date(2025, 12, 6), date(2025, 12, 5)),
+            # 闰年二月：2024-03-01 的截止日为 2024-01-31
+            (date(2024, 3, 1), date(2024, 1, 31), date(2024, 1, 30)),
+            # 平年二月：2026-03-01 的截止日为 2026-01-30
+            (date(2026, 3, 1), date(2026, 1, 30), date(2026, 1, 29)),
+        ],
+    )
+    def test_retention_boundary_across_month_year_and_leap_year(
+        self, tmp_path, today, keep_day, drop_day
+    ):
+        log_dir = tmp_path / "logs"
+        boundary = dated_file(log_dir, keep_day)
+        stale = dated_file(log_dir, drop_day)
+        service = ReceiveLogService(
+            log_dir,
+            now_ms=FakeClock(datetime(today.year, today.month, today.day, 12, 0, 0)),
+        )
+
+        service.cleanup()
+
+        assert boundary.exists()  # 恰为 today - 30 天：保留
+        assert not stale.exists()  # 第 31 天前：删除
+
     def test_ignores_non_target_entries_and_never_uses_mtime(self, tmp_path):
         log_dir = tmp_path / "logs"
         old_name = dated_file(log_dir, date(2026, 4, 1))
@@ -319,6 +346,122 @@ class TestRetention:
         assert "2026-04-01.txt" in caplog.text
 
 
+class TestStartupCleanup:
+    def test_cleanup_removes_expired_logs_without_any_event_or_write(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        stale = dated_file(log_dir, date(2026, 4, 1))
+        recent = dated_file(log_dir, date(2026, 5, 10))
+        service = ReceiveLogService(
+            log_dir, now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        )
+
+        service.cleanup()
+
+        assert not stale.exists()
+        assert recent.exists()
+        # 启动清理本身不创建/不写入当天日志文件
+        assert not (log_dir / "2026-05-17.txt").exists()
+
+    def test_cleanup_skips_missing_directory_without_creating_it(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        service = ReceiveLogService(
+            log_dir, now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        )
+
+        service.cleanup()
+
+        assert not log_dir.exists()
+
+    def test_cleanup_spares_non_target_entries_subdirectories_and_boundary(
+        self, tmp_path
+    ):
+        log_dir = tmp_path / "logs"
+        stale = dated_file(log_dir, date(2026, 4, 16))
+        boundary = dated_file(log_dir, date(2026, 4, 17))
+        notes = log_dir / "notes.txt"
+        notes.write_text("keep", encoding="utf-8")
+        compact = log_dir / "20260416.txt"
+        compact.write_text("keep", encoding="utf-8")
+        subdir = log_dir / "2020-01-01.txt"
+        subdir.mkdir()
+        service = ReceiveLogService(
+            log_dir, now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        )
+
+        service.cleanup()
+
+        assert not stale.exists()
+        assert boundary.exists()
+        assert notes.exists()
+        assert compact.exists()
+        assert subdir.is_dir()
+
+    def test_startup_cleanup_is_not_repeated_on_the_same_day_first_write(
+        self, tmp_path
+    ):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        clock = FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        service = ReceiveLogService(log_dir, now_ms=clock)
+
+        service.cleanup()
+        created_after_cleanup = dated_file(log_dir, date(2026, 4, 1))
+
+        service.write_event(event_at(datetime(2026, 5, 17, 9, 12, 3, 125000), b"A\r\n"))
+
+        assert created_after_cleanup.exists()  # 同一天不重复全目录扫描
+
+        clock.at = datetime(2026, 5, 18, 0, 0, 1)
+        service.write_event(event_at(datetime(2026, 5, 18, 0, 0, 1), b"B\r\n"))
+
+        assert not created_after_cleanup.exists()  # 跨日后首次写入前再清理（§8.2）
+        assert log_lines(log_dir / "2026-05-18.txt") == [
+            "[00:00:01.000] RX 42 0D 0A"
+        ]
+
+    def test_cleanup_listing_failure_is_logged_and_does_not_raise(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        service = ReceiveLogService(
+            log_dir, now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3))
+        )
+
+        def _raise_permission_error(self):
+            raise PermissionError("日志目录无法列举")
+
+        with monkeypatch.context() as mp:
+            mp.setattr(Path, "iterdir", _raise_permission_error)
+            with caplog.at_level(
+                logging.ERROR, logger="paimon_assistant.receive_log"
+            ):
+                service.cleanup()  # 启动辅助操作：不得向调用方抛出
+
+        assert [record.levelno for record in caplog.records] == [logging.ERROR]
+        assert "日志目录无法列举" in caplog.text
+
+
+class TestDateConversionInjection:
+    def test_injected_date_conversion_decides_the_log_file(self, tmp_path):
+        log_dir = tmp_path / "logs"
+        service = ReceiveLogService(
+            log_dir,
+            now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3)),
+            date_from_ms=lambda ms: date(2032, 1, 2),
+        )
+
+        written = service.write_event(
+            event_at(datetime(2026, 5, 17, 9, 12, 3, 125000), b"A\r\n")
+        )
+
+        assert written is True
+        assert log_lines(log_dir / "2032-01-02.txt") == [
+            "[09:12:03.125] RX 41 0D 0A"
+        ]
+        assert not (log_dir / "2026-05-17.txt").exists()
+
+
 class TestFailureIsolation:
     def test_first_write_failure_raises_and_logs_the_original_error(
         self, tmp_path, caplog
@@ -366,6 +509,64 @@ class TestFailureIsolation:
             service.write_event(
                 event_at(datetime(2026, 5, 17, 9, 12, 3, 125000), b"A\r\n")
             )
+
+    def test_non_oserror_write_failure_is_normalized_and_fuses(
+        self, tmp_path, caplog
+    ):
+        log_dir = tmp_path / "logs"
+        opener = RecordingOpener(error=RuntimeError("日志句柄异常"))
+        service = ReceiveLogService(
+            log_dir,
+            now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3)),
+            opener=opener,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="paimon_assistant.receive_log"):
+            with pytest.raises(ReceiveLogError, match="日志句柄异常"):
+                service.write_event(
+                    event_at(datetime(2026, 5, 17, 9, 12, 3, 125000), b"A\r\n")
+                )
+
+        assert [record.levelno for record in caplog.records] == [logging.ERROR]
+        assert "日志句柄异常" in caplog.text
+        assert opener.calls == [log_dir / "2026-05-17.txt"]
+
+        # 熔断：第二次直接返回 False，不再访问文件系统
+        written = service.write_event(
+            event_at(datetime(2026, 5, 17, 9, 12, 4, 0), b"B\r\n")
+        )
+        assert written is False
+        assert opener.calls == [log_dir / "2026-05-17.txt"]
+
+    def test_injected_time_conversion_failure_is_normalized_and_fuses(
+        self, tmp_path, caplog
+    ):
+        def _broken_conversion(ms):
+            raise ValueError("时间转换失败")
+
+        opener = RecordingOpener()
+        service = ReceiveLogService(
+            tmp_path / "logs",
+            now_ms=FakeClock(datetime(2026, 5, 17, 9, 12, 3)),
+            date_from_ms=_broken_conversion,
+            opener=opener,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="paimon_assistant.receive_log"):
+            with pytest.raises(ReceiveLogError, match="时间转换失败"):
+                service.write_event(
+                    event_at(datetime(2026, 5, 17, 9, 12, 3, 125000), b"A\r\n")
+                )
+
+        assert [record.levelno for record in caplog.records] == [logging.ERROR]
+        assert "时间转换失败" in caplog.text
+        assert opener.calls == []  # 转换失败：熔断前未访问文件系统
+
+        written = service.write_event(
+            event_at(datetime(2026, 5, 17, 9, 12, 4, 0), b"B\r\n")
+        )
+        assert written is False
+        assert opener.calls == []
 
     def test_circuit_breaker_returns_false_and_stops_touching_the_filesystem(
         self, tmp_path

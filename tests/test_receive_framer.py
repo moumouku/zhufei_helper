@@ -183,6 +183,39 @@ class TestOverflow:
         framer.feed(b"12345")           # a separate overflow is diagnosed again
         assert diagnostics == ["overflow", "overflow"]
 
+    def test_discard_state_recovers_when_terminator_is_split_across_feeds(self):
+        diagnostics = []
+        framer = ReceiveFramer(
+            clock_ms=FakeClock(1000),
+            max_payload_bytes=4,
+            on_overflow=lambda: diagnostics.append("overflow"),
+        )
+
+        assert framer.feed(b"x" * 5) == []  # 第 5 个载荷字节：进入丢弃
+        assert diagnostics == ["overflow"]
+
+        assert framer.feed(b"\r") == []  # 结束符前半块：仍在丢弃
+        assert framer.feed(b"\n") == []  # 结束符后半块：恢复分帧
+
+        assert framer.feed(b"ok\r\n") == [ReceivedEvent(1000, b"ok", b"ok\r\n")]
+        assert diagnostics == ["overflow"]  # 同一段溢出只诊断一次
+
+    def test_bare_lf_at_the_payload_limit_starts_discarding(self):
+        diagnostics = []
+        framer = ReceiveFramer(
+            clock_ms=FakeClock(1000),
+            max_payload_bytes=4,
+            on_overflow=lambda: diagnostics.append("overflow"),
+        )
+
+        assert framer.feed(b"abcd") == []  # 缓冲恰好到上限仍有效
+        assert framer.feed(b"\n") == []  # 裸 LF 是载荷：第 5 个字节触发丢弃
+        assert diagnostics == ["overflow"]
+
+        assert framer.feed(b"more\r\n") == []  # 丢弃直到下一个结束符
+        assert framer.feed(b"ok\r\n") == [ReceivedEvent(1000, b"ok", b"ok\r\n")]
+        assert diagnostics == ["overflow"]
+
     def test_reset_rearms_overflow_diagnosis(self):
         diagnostics = []
         framer = ReceiveFramer(

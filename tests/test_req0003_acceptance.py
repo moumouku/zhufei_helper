@@ -628,6 +628,73 @@ def test_ac15_retention_cleans_expired_logs_at_startup_and_across_midnight(
         controller.close()
 
 
+def test_ac15_startup_cleanup_runs_without_any_received_event(tmp_path, qtbot):
+    """§13.15/§8.1 零事件启动：构造主窗口即清理过期日志，且不误删其他文件。"""
+    now = FakeNow(TODAY)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    stale = log_dir / "2026-04-16.txt"  # 超出 30 天：启动时即删除
+    stale.write_text("drop", encoding="utf-8")
+    boundary = log_dir / "2026-04-17.txt"  # 恰为 30 天边界：保留
+    boundary.write_text("keep", encoding="utf-8")
+    notes = log_dir / "notes.txt"
+    notes.write_text("keep", encoding="utf-8")
+    subdir = log_dir / "2020-01-01.txt"
+    subdir.mkdir()
+
+    controller, _ = make_controller([[]])
+    window = make_window(qtbot, controller, ReceiveLogService(log_dir, now_ms=now))
+    try:
+        assert not stale.exists()
+        assert boundary.exists() and notes.exists() and subdir.is_dir()
+        # 启动清理本身不写日志，也不创建当天文件
+        assert not (log_dir / "2026-05-17.txt").exists()
+    finally:
+        controller.close()
+
+
+def test_ac15_startup_cleanup_missing_dir_skipped_without_creating_it(
+    tmp_path, qtbot
+):
+    """§13.15/§8.1 日志目录不存在时启动清理不报错，也不为清理创建目录。"""
+    log_dir = tmp_path / "logs"
+    controller, _ = make_controller([[]])
+    window = make_window(
+        qtbot, controller, ReceiveLogService(log_dir, now_ms=FakeNow(TODAY))
+    )
+    try:
+        assert not log_dir.exists()
+    finally:
+        controller.close()
+
+
+def test_ac15_startup_cleanup_failure_does_not_break_window_startup(
+    tmp_path, qtbot, monkeypatch
+):
+    """§13.15/§8.1 启动清理失败只记日志，不影响主窗口启动与后续接收显示。"""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    controller, _ = make_controller([[]])
+
+    def _raise_permission_error(self):
+        raise PermissionError("日志目录无法列举")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(Path, "iterdir", _raise_permission_error)
+        window = make_window(
+            qtbot, controller, ReceiveLogService(log_dir, now_ms=FakeNow(TODAY))
+        )
+
+    # 清理失败不阻断启动：接收事件仍能显示
+    window.timestamp_checkbox.setChecked(False)
+    controller.received_queue.put(ReceivedEvent(0, b"ok", b"ok\r\n"))
+    window._drain_queues()
+    try:
+        assert window.display_edit.toPlainText() == "ok\n"
+    finally:
+        controller.close()
+
+
 def test_ac16_log_dir_entry_opens_the_log_directory(tmp_path, qtbot):
     """§13.16 “日志目录”入口能打开日志目录（目录本身，而非某个日期文件）。"""
     log_dir = tmp_path / "logs"

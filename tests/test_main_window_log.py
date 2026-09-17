@@ -14,11 +14,15 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import importlib  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
+from datetime import datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 
-from paimon_assistant.receive_log import ReceiveLogError  # noqa: E402
+from paimon_assistant.receive_log import (  # noqa: E402
+    ReceiveLogError,
+    ReceiveLogService,
+)
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,7 @@ class FakeLogService:
         self.events = []  # 成功写入的 event
         self.fs_attempts = 0  # 实际访问文件系统的次数（熔断后不再增长）
         self.ensure_calls = 0
+        self.cleanup_calls = 0  # 启动清理（REQ §8.1）调用次数
         self.ensure_error = None  # 设置后 ensure_directory() 抛出
         self.on_write = None  # 可选回调：在 write_event 调用点观察外部状态
         self._remaining_failures = fail_writes
@@ -79,6 +84,9 @@ class FakeLogService:
         self.ensure_calls += 1
         if self.ensure_error is not None:
             raise self.ensure_error
+
+    def cleanup(self):
+        self.cleanup_calls += 1
 
     def write_event(self, event):
         self.calls.append(event)
@@ -93,6 +101,17 @@ class FakeLogService:
             raise ReceiveLogError("Receive log write failed: 磁盘已满")
         self.events.append(event)
         return True
+
+
+class ExplodingOpener:
+    """真实日志服务的注入式 opener：抛非 OSError 的异常并记录调用次数。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, path):
+        self.calls += 1
+        raise RuntimeError("日志句柄异常")
 
 
 @pytest.fixture
@@ -214,6 +233,37 @@ def test_first_log_failure_shows_fixed_red_label_and_keeps_receiving(
     controller.received_queue.put(FakeEvent(0, b"third", b"third\r\n"))
     window._drain_queues()
     assert window.log_error_label.text() == "日志目录打开失败：目录不可用"
+
+
+def test_non_oserror_log_failure_is_isolated_from_display_and_queue(
+    tmp_path, qtbot, mw, controller, dialogs
+):
+    """日志层非 OSError 失败也必须熔断：显示继续、队列消费不中断（§7.3.8）。"""
+    opener = ExplodingOpener()
+    log_service = ReceiveLogService(
+        tmp_path / "logs",
+        now_ms=lambda: int(datetime(2026, 5, 17, 9, 12, 3).timestamp() * 1000),
+        opener=opener,
+    )
+    window = _window(qtbot, mw, controller, log_service)
+    window.timestamp_checkbox.setChecked(False)
+
+    first = FakeEvent(0, b"first", b"first\r\n")
+    second = FakeEvent(0, b"second", b"second\r\n")
+    controller.received_queue.put(first)
+    window._drain_queues()  # 首次失败：不得穿透到 _drain_queues
+
+    assert opener.calls == 1
+    assert window.log_error_label.text() == LOG_WRITE_FAILED_TEXT
+    assert window.display_edit.toPlainText() == "first\n"
+
+    controller.received_queue.put(second)  # 熔断后队列消费与显示继续
+    window._drain_queues()
+
+    assert opener.calls == 1
+    assert window.display_edit.toPlainText() == "first\nsecond\n"
+    assert window.log_error_label.text() == LOG_WRITE_FAILED_TEXT
+    assert dialogs["critical"] == [] and dialogs["warning"] == []
 
 
 def test_fused_service_returning_false_shows_label_and_never_retries(

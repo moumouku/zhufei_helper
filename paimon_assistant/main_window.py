@@ -59,6 +59,9 @@ class MainWindow(QMainWindow):
         self._log_service = (
             log_service if log_service is not None else ReceiveLogService()
         )
+        # REQ-0003 §8.1：程序启动时执行一次日志保留清理。
+        # cleanup() 自身不创建目录、不抛异常，启动路径无需额外防御。
+        self._log_service.cleanup()
         self._log_dir_opener = (
             log_dir_opener if log_dir_opener is not None else _default_log_dir_opener
         )
