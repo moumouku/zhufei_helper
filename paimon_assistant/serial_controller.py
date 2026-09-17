@@ -1,18 +1,23 @@
 """Threaded serial-port controller for Paimon Assistant.
 
 The controller owns one serial connection at a time. Every successful open
-uses fresh receive/error queues and passes those queues directly to its reader
-thread, which keeps delayed events from an earlier connection out of a newly
-opened session.
+creates a fresh receive session (a ``ReceiveFramer`` plus its queues); the
+reader thread only publishes ``ReceivedEvent`` objects into that session's
+queue. ``reset_receive_session()`` swaps the session's framing state under the
+session lock, which is the single linearization point between pre-clear and
+post-clear data. (REQ-0003 §5.1, §10.1)
 """
 
 from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections import namedtuple
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
+
+from paimon_assistant.receive_framer import ReceiveFramer
 
 try:
     # Re-export from config when it exists so both modules stay in sync.
@@ -43,6 +48,49 @@ class SerialConnectionError(Exception):
 
 SerialPortInfo = namedtuple("SerialPortInfo", ["port", "description"])
 
+#: Fixed text published to ``diagnostic_queue`` for one continuous overflow
+#: (REQ-0003 §6.1.7). The callback only does ``queue.put``.
+_OVERFLOW_DIAGNOSTIC = "接收帧超过 1 MiB，已丢弃"
+
+
+def _epoch_ms() -> int:
+    """Default millisecond clock: Unix epoch milliseconds."""
+    return int(time.time() * 1000)
+
+
+def _discard_pending(q: queue.Queue) -> None:
+    """Drop every item currently queued (used when a session is reset)."""
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
+class _ReceiveSession:
+    """Framing state shared by the controller and one connection's reader.
+
+    ``generation`` identifies the controller's current receive generation.
+    The reader publishes under the session lock only while the generation is
+    still current, so a delayed reader from a closed connection can never
+    leak into a later session. Resetting the receive session mutates this
+    object in place, which keeps the same open reader publishing through the
+    fresh framer and queues.
+    """
+
+    __slots__ = ("generation", "framer", "received_queue", "diagnostic_queue")
+
+    def __init__(self, generation: int, clock_ms: Callable[[], int]) -> None:
+        self.generation = generation
+        self.received_queue: queue.Queue = queue.Queue()
+        self.diagnostic_queue: queue.Queue = queue.Queue()
+        self.framer = ReceiveFramer(clock_ms, on_overflow=self._on_overflow)
+
+    def _on_overflow(self) -> None:
+        # Reads the current queue at call time so a reset that swapped the
+        # queue is honored. Only queue.put: no Qt, no file I/O, no logging.
+        self.diagnostic_queue.put(_OVERFLOW_DIAGNOSTIC)
+
 
 class SerialController:
     """Owns one serial connection and its background reader thread."""
@@ -55,6 +103,7 @@ class SerialController:
         self,
         serial_factory: Optional[Callable[..., Any]] = None,
         port_lister: Optional[Callable[[], List[Any]]] = None,
+        clock_ms: Optional[Callable[[], int]] = None,
     ) -> None:
         if serial_factory is None:
             serial_factory = _serial.Serial if _serial is not None else None
@@ -62,21 +111,27 @@ class SerialController:
             port_lister = (
                 _list_ports.comports if _list_ports is not None else (lambda: [])
             )
+        if clock_ms is None:
+            clock_ms = _epoch_ms
         self._factory = serial_factory
         self._port_lister = port_lister
+        self._clock_ms = clock_ms
         self.received_queue: queue.Queue = queue.Queue()
+        self.diagnostic_queue: queue.Queue = queue.Queue()
         self.error_queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._ser: Any = None
         self._reader: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
+        self._session_lock = threading.Lock()
+        self._session: Optional[_ReceiveSession] = None
+        self._generation = 0
         self._is_open = False
 
     # -- state -------------------------------------------------------------
 
     @property
     def is_open(self) -> bool:
-        with self._lock:
+        with self._session_lock:
             return self._is_open
 
     # -- enumeration -------------------------------------------------------
@@ -104,16 +159,6 @@ class SerialController:
                 "pyserial is not installed; inject a serial_factory"
             )
 
-        # A reader keeps direct references to its session queues. Replacing
-        # these before each attempt prevents queued data/errors from a closed
-        # connection from affecting a later one, even if an old read unblocks
-        # after the new port has opened.
-        received_queue: queue.Queue = queue.Queue()
-        error_queue: queue.Queue = queue.Queue()
-        with self._lock:
-            self.received_queue = received_queue
-            self.error_queue = error_queue
-
         ser: Any = None
         try:
             ser = self._factory(
@@ -138,14 +183,24 @@ class SerialController:
                 f"serial factory returned no port for {settings.port!r}"
             )
 
+        # The reader keeps a direct reference to its session (framer + queues)
+        # and publishes only while that session's generation is current, so
+        # data from a closed connection can never reach a later one.
+        error_queue: queue.Queue = queue.Queue()
         stop_event = threading.Event()
-        reader = threading.Thread(
-            target=self._reader_loop,
-            args=(ser, stop_event, received_queue, error_queue),
-            name="serial-reader",
-            daemon=True,
-        )
-        with self._lock:
+        with self._session_lock:
+            self._generation += 1
+            session = _ReceiveSession(self._generation, self._clock_ms)
+            reader = threading.Thread(
+                target=self._reader_loop,
+                args=(ser, stop_event, session, error_queue),
+                name="serial-reader",
+                daemon=True,
+            )
+            self._session = session
+            self.received_queue = session.received_queue
+            self.diagnostic_queue = session.diagnostic_queue
+            self.error_queue = error_queue
             self._stop = stop_event
             self._ser = ser
             self._reader = reader
@@ -154,12 +209,15 @@ class SerialController:
             reader.start()
         except Exception as exc:
             stop_event.set()
-            with self._lock:
+            with self._session_lock:
                 if self._reader is reader:
                     self._reader = None
                 if self._ser is ser:
                     self._ser = None
                     self._is_open = False
+                if self._session is session:
+                    self._generation += 1
+                    self._session = None
             try:
                 ser.close()
             except Exception:
@@ -169,9 +227,18 @@ class SerialController:
             ) from exc
 
     def close(self) -> None:
-        with self._lock:
-            if not self._is_open and self._ser is None and self._reader is None:
+        with self._session_lock:
+            if (
+                not self._is_open
+                and self._ser is None
+                and self._reader is None
+                and self._session is None
+            ):
                 return
+            # Invalidate the session before the reader can publish again: a
+            # delayed read from this connection must not reach any later one.
+            self._generation += 1
+            self._session = None
             stop_event = self._stop
             stop_event.set()
             ser = self._ser
@@ -199,7 +266,7 @@ class SerialController:
             reader.join(timeout=self._JOIN_TIMEOUT)
 
     def write(self, data: bytes) -> None:
-        with self._lock:
+        with self._session_lock:
             if not self._is_open or self._ser is None:
                 raise SerialConnectionError("serial port is not open")
             ser = self._ser
@@ -219,9 +286,11 @@ class SerialController:
         was opened concurrently, it is left untouched. The reader is stopped
         with a bounded join to keep shutdown latency predictable.
         """
-        with self._lock:
+        with self._session_lock:
             if self._ser is not ser:
                 return
+            self._generation += 1
+            self._session = None
             stop_event = self._stop
             stop_event.set()
             reader = self._reader
@@ -248,16 +317,46 @@ class SerialController:
         ):
             reader.join(timeout=self._JOIN_TIMEOUT)
 
+    # -- session reset -----------------------------------------------------
+
+    def reset_receive_session(self) -> None:
+        """Atomically drop the current session's framing state and queued data.
+
+        This is the linearization point between "before clear" and "after
+        clear" data (REQ-0003 §10.1): it bumps the generation, resets the
+        framer and replaces both receive queues, discarding every item still
+        pending in the old queue objects. Safe while closed: it never touches
+        the serial port.
+        """
+        with self._session_lock:
+            self._generation += 1
+            old_received = self.received_queue
+            old_diagnostic = self.diagnostic_queue
+            self.received_queue = queue.Queue()
+            self.diagnostic_queue = queue.Queue()
+            session = self._session
+            if session is not None:
+                session.generation = self._generation
+                session.received_queue = self.received_queue
+                session.diagnostic_queue = self.diagnostic_queue
+                session.framer.reset()
+            _discard_pending(old_received)
+            _discard_pending(old_diagnostic)
+
     # -- background reader -------------------------------------------------
 
     def _reader_loop(
         self,
         ser: Any,
         stop_event: threading.Event,
-        received_queue: queue.Queue,
+        session: _ReceiveSession,
         error_queue: queue.Queue,
     ) -> None:
-        """Read one connection and publish only to that connection's queues."""
+        """Read one connection, frame it and publish its events.
+
+        Only serial reading, framing and queue publication happen here: no
+        file I/O and no logging, so the reader never depends on log state.
+        """
         while not stop_event.is_set():
             try:
                 data = ser.read(self._READ_CHUNK)
@@ -271,18 +370,30 @@ class SerialController:
             if data:
                 if stop_event.is_set():
                     break
-                try:
-                    received_queue.put(data)
-                except Exception:
-                    break
+                self._publish_events(session, data)
             else:
                 stop_event.wait(self._READ_POLL)
 
+    def _publish_events(self, session: _ReceiveSession, data: bytes) -> None:
+        """Frame one read chunk and enqueue its events under the session lock.
+
+        Holding the lock across feed + enqueue makes ``reset_receive_session``
+        a single linearization point, and the generation check drops output
+        from a reader whose connection was closed or replaced mid-read.
+        """
+        with self._session_lock:
+            if session.generation != self._generation:
+                return
+            for event in session.framer.feed(data):
+                session.received_queue.put(event)
+
     def _mark_reader_failed(self, ser: Any, stop_event: threading.Event) -> None:
         """Move the active controller to closed state after a read failure."""
-        with self._lock:
+        with self._session_lock:
             if self._ser is not ser or self._stop is not stop_event:
                 return
+            self._generation += 1
+            self._session = None
             self._ser = None
             self._is_open = False
             stop_event.set()
