@@ -2,10 +2,11 @@
 
 派蒙助手是一个面向 Windows 的极简串口调试上位机。它通过串口接收设备数据并实时显示原始内容，同时支持发送文本或 HEX 数据。
 
-当前版本：`v0.4.0`。
+当前版本：`v0.5.0`。
 
 完整操作步骤见 [docs/user-manual.md](docs/user-manual.md)。
 按功能独立管理的需求文档见 [docs/requirements/index.md](docs/requirements/index.md)。
+界面设计方案与实施记录见 [docs/ui-design/ui-design.md](docs/ui-design/ui-design.md)。
 版本变更及实现清单见 [CHANGELOG.md](CHANGELOG.md)。
 使用 AI 更新并安全发布新版本见 [docs/ai-update-guide.md](docs/ai-update-guide.md)。
 
@@ -18,12 +19,12 @@ PaimonAssistant.exe
 ```
 
 - 仓库内直接获取（点开文件页面右上角的 Download raw file）：<https://github.com/moumouku/zhufei_helper/blob/main/PaimonAssistant.exe>
-- `v0.4.0` 发布页：<https://github.com/moumouku/zhufei_helper/releases/tag/v0.4.0>
+- `v0.5.0` 发布页：<https://github.com/moumouku/zhufei_helper/releases/tag/v0.5.0>
 
 当前文件 SHA256：
 
 ```text
-a8d55b28585a9912afd7ed8bd7d1fa37bb968ad6a869a6f3f152b3fae639df0a
+20a7c6b82306b6aeb3ebec70be40e20f4f77d3f1797d9e5bf8be3ed3177e5e07
 ```
 
 下载后可用下面的命令校验：
@@ -36,6 +37,11 @@ Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
 
 ## 功能
 
+- 深色「派蒙·石墨」界面：按“连接、接收、发送”分区，接收数据是视觉中心；界面中文使用 Microsoft YaHei UI，接收显示区与发送输入框使用 Consolas 等宽字体
+- 默认窗口 1080 x 680、最小 760 x 480；窗口底部状态栏显示连接状态、端口与串口参数、解析模式和日志状态
+- 串口参数使用可折叠行，按钮实时显示 `8N1`、`7E1.5` 等摘要；展开/收起不重置参数
+- “跟随最新”默认开启：上翻历史时自动暂停跟随并继续接收与写日志，点击“回到最新”恢复；两种解析模式分别记住各自阅读位置
+- 同一时刻只有一个主操作：未连接突出“打开”，已连接突出“发送”
 - 自动枚举可用 COM 口
 - 每约 1 秒自动监测串口热插拔，按差量更新端口列表
 - 新端口按规则自动选中但绝不自动打开；连接端口连续两次轮询缺失后自动关闭并提示
@@ -93,7 +99,7 @@ $env:QT_QPA_PLATFORM = "offscreen"
 Remove-Item Env:QT_QPA_PLATFORM
 ```
 
-测试重点包括配置校验、UTF-8/GBK 解码、HEX 解析、串口 reader 生命周期、会话隔离、严格 `\r\n` 分帧与超长帧处理、接收事件渲染、接收解析模式切换、日志格式与 30 日保留清理、日志故障隔离、清空边界、主窗口收发、热插拔差量与去抖策略和入口冒烟。自动化测试当前结果为 `330 passed, 6 skipped`（跳过项为需要创建符号链接特权的用例和默认跳过的真实串口验收）。测试通过会话级环境隔离保证不会写入真实的 `%LOCALAPPDATA%\PaimonAssistant\logs\`。
+测试重点包括配置校验、UTF-8/GBK 解码、HEX 解析、串口 reader 生命周期、会话隔离、严格 `\r\n` 分帧与超长帧处理、接收事件渲染、接收解析模式切换、日志格式与 30 日保留清理、日志故障隔离、清空边界、主窗口收发、界面主题与字体、布局与折叠行、状态栏事实、历史阅读跟随、热插拔差量与去抖策略和入口冒烟。自动化测试当前结果为 `390 passed, 6 skipped`（跳过项为需要创建符号链接特权的用例和默认跳过的真实串口验收）。测试通过会话级环境隔离保证不会写入真实的 `%LOCALAPPDATA%\PaimonAssistant\logs\`。
 
 真实 com0com 端到端验收默认跳过，可显式执行：
 

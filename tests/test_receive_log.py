@@ -464,6 +464,32 @@ class TestDateConversionInjection:
 
 
 class TestFailureIsolation:
+    def test_failed_property_tracks_current_fuse_without_io(self, tmp_path):
+        opener = RecordingOpener(error=PermissionError("disk is full"))
+        log_dir = tmp_path / "logs"
+        service = ReceiveLogService(log_dir, opener=opener)
+        assert service.failed is False
+        assert not log_dir.exists()
+        with pytest.raises(AttributeError):
+            service.failed = True
+        event = event_at(datetime(2026, 5, 17, 9, 12, 3), b"A\r\n")
+        with pytest.raises(ReceiveLogError):
+            service.write_event(event)
+        assert service.failed is True
+        assert service.write_event(event) is False
+        service.ensure_directory()
+        service.cleanup()
+        assert service.failed is True
+        assert len(opener.calls) == 1
+
+    def test_directory_entry_failure_is_not_a_log_write_fuse(self, tmp_path):
+        blocked = tmp_path / "logs"
+        blocked.write_text("not a directory", encoding="utf-8")
+        service = ReceiveLogService(blocked)
+        with pytest.raises(ReceiveLogError):
+            service.ensure_directory()
+        assert service.failed is False
+
     def test_first_write_failure_raises_and_logs_the_original_error(
         self, tmp_path, caplog
     ):

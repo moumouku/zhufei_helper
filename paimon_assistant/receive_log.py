@@ -105,6 +105,11 @@ class ReceiveLogService:
         """Resolved log directory (the "日志目录" entry opens this path)."""
         return self._log_dir
 
+    @property
+    def failed(self) -> bool:
+        """Whether writes are currently disabled by this service's circuit breaker."""
+        return self._broken
+
     def _create_directory(self) -> None:
         self._log_dir.mkdir(parents=True, exist_ok=True)
 

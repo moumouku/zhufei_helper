@@ -18,11 +18,13 @@ from datetime import datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
+from PySide6.QtGui import QColor, QPalette  # noqa: E402
 
 from paimon_assistant.receive_log import (  # noqa: E402
     ReceiveLogError,
     ReceiveLogService,
 )
+from paimon_assistant.theme import COLORS  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,10 @@ class FakeLogService:
         self.on_write = None  # 可选回调：在 write_event 调用点观察外部状态
         self._remaining_failures = fail_writes
         self._fused = start_fused
+
+    @property
+    def failed(self):
+        return self._fused
 
     def ensure_directory(self):
         self.ensure_calls += 1
@@ -217,7 +223,7 @@ def test_first_log_failure_shows_fixed_red_label_and_keeps_receiving(
     label = window.log_error_label
     assert label.objectName() == "log_error_label"
     assert label.text() == LOG_WRITE_FAILED_TEXT
-    assert "red" in label.styleSheet()
+    assert COLORS["error"] in label.styleSheet()
     assert dialogs["critical"] == [] and dialogs["warning"] == []
     # 日志故障不丢显示
     assert window.display_edit.toPlainText() == "first\n"
@@ -312,7 +318,7 @@ def test_diagnostic_queue_shows_fixed_text_without_blocking_display(
 
     label = window.receive_error_label
     assert label.text() == "接收帧超过 1 MiB，已丢弃"
-    assert "red" in label.styleSheet()
+    assert COLORS["error"] in label.styleSheet()
     assert dialogs["critical"] == [] and dialogs["warning"] == []
     # 诊断不阻断正常显示与日志
     assert window.display_edit.toPlainText() == "after\n"
@@ -402,6 +408,82 @@ def test_log_dir_opener_failure_shows_reason_and_keeps_receiving(
     assert window.display_edit.toPlainText() == "alive\n"
     assert len(log_service.events) == 1
     assert dialogs["critical"] == [] and dialogs["warning"] == []
+
+
+# ------------------------------------------------- 当前日志状态与提示显隐
+
+
+def test_log_status_uses_service_state_when_switching_modes(tmp_path, qtbot, mw, controller):
+    log_service = FakeLogService(tmp_path / "logs", fail_writes=1)
+    window = _window(qtbot, mw, controller, log_service)
+    assert window.log_error_label.isHidden()
+    assert "日志已启用" in window.receive_status_label.text()
+    controller.received_queue.put(FakeEvent(0, b"first", b"first\r\n"))
+    window._drain_queues()
+    assert not window.log_error_label.isHidden()
+    assert "日志写入失败" in window.receive_status_label.text()
+
+    _select(window.parse_mode_combo, mw.RAW_MODE)
+    label = window.receive_status_label
+    assert "不记录日志" in label.text()
+    assert "失败" not in label.text()
+    label.ensurePolished()
+    assert label.palette().color(QPalette.ColorRole.WindowText) == QColor(COLORS["secondary"])
+    _select(window.parse_mode_combo, mw.FRAMED_MODE)
+    assert "日志写入失败" in label.text()
+    label.ensurePolished()
+    assert label.palette().color(QPalette.ColorRole.WindowText) == QColor(COLORS["error"])
+    assert log_service.fs_attempts == 1
+    assert len(log_service.calls) == 1
+
+
+def test_prefused_log_service_is_reported_without_attempting_a_write(tmp_path, qtbot, mw, controller):
+    service = FakeLogService(tmp_path / "logs", start_fused=True)
+    window = _window(qtbot, mw, controller, service)
+    assert "日志写入失败" in window.receive_status_label.text()
+    assert service.calls == []
+    assert service.fs_attempts == 0
+
+
+def test_directory_failure_does_not_falsely_disable_logging_and_retry_clears_hint(
+    tmp_path, qtbot, mw, controller
+):
+    service = FakeLogService(tmp_path / "logs")
+    service.ensure_error = ReceiveLogError("目录不可用")
+    window = _window(qtbot, mw, controller, service, log_dir_opener=lambda path: None)
+    window.log_dir_button.click()
+    assert not window.log_error_label.isHidden()
+    assert "日志目录打开失败" in window.log_error_label.text()
+    assert "日志已启用" in window.receive_status_label.text()
+    service.ensure_error = None
+    window.log_dir_button.click()
+    assert window.log_error_label.isHidden()
+    assert window.log_error_label.text() == ""
+    assert service.calls == []
+
+
+def test_successful_directory_open_cannot_clear_current_write_failure(tmp_path, qtbot, mw, controller):
+    service = FakeLogService(tmp_path / "logs", fail_writes=1)
+    window = _window(qtbot, mw, controller, service, log_dir_opener=lambda path: None)
+    controller.received_queue.put(FakeEvent(0, b"first", b"first\r\n"))
+    window._drain_queues()
+    window.log_dir_button.click()
+    assert "日志写入失败" in window.receive_status_label.text()
+    assert window.log_error_label.text() == LOG_WRITE_FAILED_TEXT
+    assert not window.log_error_label.isHidden()
+    window.clear_button.click()
+    assert not window.log_error_label.isHidden()
+    assert service.fs_attempts == 1
+
+
+def test_status_does_not_read_old_error_label_as_current_log_state(tmp_path, qtbot, mw, controller):
+    service = FakeLogService(tmp_path / "logs")
+    window = _window(qtbot, mw, controller, service)
+    window.log_error_label.setText(LOG_WRITE_FAILED_TEXT)
+    _select(window.parse_mode_combo, mw.RAW_MODE)
+    _select(window.parse_mode_combo, mw.FRAMED_MODE)
+    assert "日志已启用" in window.receive_status_label.text()
+    assert service.calls == []
 
 
 # ------------------------------------------------- 显示切换 / 发送回归

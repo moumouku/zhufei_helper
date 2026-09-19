@@ -18,6 +18,7 @@ from dataclasses import dataclass  # noqa: E402
 import pytest  # noqa: E402
 
 from paimon_assistant.receive_log import ReceiveLogService  # noqa: E402
+from paimon_assistant.theme import COLORS  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -109,7 +110,7 @@ def test_receive_error_label_exists_red_and_initially_empty(window):
     label = window.receive_error_label
     assert label.objectName() == "receive_error_label"
     assert label.text() == ""
-    assert "red" in label.styleSheet()
+    assert COLORS["error"] in label.styleSheet()
 
 
 def test_clear_also_clears_receive_error_label(window, controller):

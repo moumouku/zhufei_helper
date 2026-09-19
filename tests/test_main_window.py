@@ -18,12 +18,17 @@ import importlib
 import os
 import queue
 from dataclasses import dataclass
+from datetime import date
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
+from PySide6.QtCore import QPoint, QRect, QSize, Qt  # noqa: E402
+from PySide6.QtGui import QColor, QPalette  # noqa: E402
+from PySide6.QtWidgets import QStatusBar  # noqa: E402
 
 from paimon_assistant.receive_log import ReceiveLogService  # noqa: E402
+from paimon_assistant.theme import COLORS  # noqa: E402
 
 PUBLIC_WIDGETS = [
     "port_combo",
@@ -40,6 +45,7 @@ PUBLIC_WIDGETS = [
     "send_edit",
     "send_mode_combo",
     "send_button",
+    "follow_latest_button",
 ]
 
 
@@ -165,6 +171,269 @@ def test_window_title(window):
 def test_public_widget_attributes_exist(window):
     for name in PUBLIC_WIDGETS:
         assert getattr(window, name) is not None, f"缺少公开属性 {name}"
+
+
+# ---------- 布局与串口参数折叠行 ----------
+
+
+def _rect_in_window(window, widget):
+    return QRect(widget.mapTo(window, QPoint(0, 0)), widget.size())
+
+
+def test_window_initial_and_minimum_sizes(window):
+    assert window.size() == QSize(1080, 680)
+    assert window.minimumSize() == QSize(760, 480)
+
+
+def test_serial_parameters_fold_without_resetting_values(window, qapp):
+    window.show()
+    qapp.processEvents()
+    button = window.serial_parameters_button
+    row = window.serial_parameters_row
+    assert button.isCheckable()
+    assert not button.isChecked()
+    assert row.isHidden()
+    assert button.text() == "串口参数 8N1"
+
+    button.click()
+    assert row.isVisibleTo(window)
+    window.data_bits_combo.setCurrentText("7")
+    assert button.text() == "串口参数 7N1"
+    window.parity_combo.setCurrentText("E")
+    assert button.text() == "串口参数 7E1"
+    window.stop_bits_combo.setCurrentText("1.5")
+    assert button.text() == "串口参数 7E1.5"
+
+    button.click()
+    assert row.isHidden()
+    assert button.text() == "串口参数 7E1.5"
+    button.click()
+    assert window.data_bits_combo.currentText() == "7"
+    assert window.parity_combo.currentText() == "E"
+    assert window.stop_bits_combo.currentText() == "1.5"
+
+
+def test_folded_parameters_reach_controller_and_stay_locked_when_open(
+    window, controller
+):
+    window.serial_parameters_button.click()
+    window.data_bits_combo.setCurrentText("5")
+    window.parity_combo.setCurrentText("M")
+    window.stop_bits_combo.setCurrentText("2")
+    window.serial_parameters_button.click()
+    _open(window)
+
+    settings = controller.opened_settings[-1]
+    assert (settings.data_bits, settings.parity, settings.stop_bits) == (5, "M", 2)
+    assert window.serial_parameters_button.text() == "串口参数 5M2"
+    assert window.serial_parameters_button.isEnabled()
+    window.serial_parameters_button.click()
+    assert not window.serial_parameters_row.isHidden()
+    controls = (window.data_bits_combo, window.parity_combo, window.stop_bits_combo)
+    assert all(not control.isEnabled() for control in controls)
+    window.open_button.click()
+    assert all(control.isEnabled() for control in controls)
+    assert window.serial_parameters_button.text() == "串口参数 5M2"
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+def test_parameter_fold_and_tab_navigation_work_with_keyboard(
+    window, qtbot, expanded
+):
+    window.show()
+    window.activateWindow()
+    button = window.serial_parameters_button
+    button.setFocus()
+    qtbot.waitUntil(button.hasFocus)
+    if expanded:
+        qtbot.keyClick(button, Qt.Key.Key_Space)
+    assert button.isChecked() == expanded
+    assert window.serial_parameters_row.isVisibleTo(window) == expanded
+
+    window.encoding_combo.setFocus()
+    qtbot.keyClick(window.encoding_combo, Qt.Key.Key_Tab)
+    expected = window.data_bits_combo if expanded else window.receive_mode_combo
+    qtbot.waitUntil(expected.hasFocus)
+    if expanded:
+        qtbot.keyClick(expected, Qt.Key.Key_Tab)
+        qtbot.waitUntil(window.parity_combo.hasFocus)
+        qtbot.keyClick(window.parity_combo, Qt.Key.Key_Tab)
+        qtbot.waitUntil(window.stop_bits_combo.hasFocus)
+        qtbot.keyClick(window.stop_bits_combo, Qt.Key.Key_Tab)
+        qtbot.waitUntil(window.receive_mode_combo.hasFocus)
+
+
+@pytest.mark.parametrize("size", [(760, 480), (1080, 680)])
+@pytest.mark.parametrize("expanded", [False, True])
+def test_reorganized_controls_fit_without_overlap(window, qapp, size, expanded):
+    window.resize(*size)
+    window.serial_parameters_button.setChecked(expanded)
+    window.show()
+    qapp.processEvents()
+    assert window.size() == QSize(*size)
+    central = _rect_in_window(window, window.centralWidget())
+    names = PUBLIC_WIDGETS + [
+        "serial_parameters_button", "parse_mode_combo", "timestamp_checkbox",
+        "log_dir_button",
+    ]
+    parameters = {"data_bits_combo", "parity_combo", "stop_bits_combo"}
+    rectangles = []
+    for name in names:
+        widget = getattr(window, name)
+        if name in parameters and not expanded:
+            assert not widget.isVisibleTo(window)
+            continue
+        assert widget.isVisibleTo(window), name
+        rect = _rect_in_window(window, widget)
+        assert central.contains(rect), name
+        for other_name, other_rect in rectangles:
+            assert not rect.intersects(other_rect), (name, other_name)
+        rectangles.append((name, rect))
+
+    rect = lambda name: _rect_in_window(window, getattr(window, name))
+    assert rect("open_button").top() == rect("port_combo").top()
+    assert rect("open_button").bottom() < rect("receive_mode_combo").top()
+    assert rect("encoding_combo").bottom() < rect("receive_mode_combo").top()
+    assert rect("receive_mode_combo").bottom() < rect("display_edit").top()
+    assert rect("display_edit").bottom() < rect("send_edit").top()
+    assert rect("send_mode_combo").top() == rect("send_edit").top()
+    assert rect("send_mode_combo").right() < rect("send_edit").left()
+    assert rect("send_edit").right() < rect("send_button").left()
+
+
+def test_connection_bar_reflows_without_changing_inputs_or_focus(window, qapp, qtbot):
+    window.show()
+    window.activateWindow()
+    window.baud_combo.setEditText("123456")
+    window.encoding_combo.setCurrentText("GBK")
+    window.send_edit.setText("pending send")
+    window.send_edit.setFocus()
+    qtbot.waitUntil(window.send_edit.hasFocus)
+    for width, stacked in ((1080, False), (760, True), (1080, False)):
+        window.resize(width, 680)
+        qapp.processEvents()
+        assert window.width() == width
+        port = _rect_in_window(window, window.port_combo)
+        encoding = _rect_in_window(window, window.encoding_combo)
+        assert (encoding.top() > port.top()) == stacked
+        assert window.baud_combo.currentText() == "123456"
+        assert window.encoding_combo.currentText() == "GBK"
+        assert window.send_edit.text() == "pending send"
+        assert window.send_edit.hasFocus()
+
+
+def test_status_bar_shows_current_facts_below_send_controls(window, qapp):
+    window.show()
+    qapp.processEvents()
+    bar = window.findChild(QStatusBar)
+    assert bar is not None
+    assert bar.isVisibleTo(window)
+    assert window.connection_status_label.text() == "未连接"
+    assert "日志已启用" in window.receive_status_label.text()
+    assert _rect_in_window(window, bar).top() > _rect_in_window(window, window.send_edit).bottom()
+
+
+# ---------- 当前连接事实与唯一主操作 ----------
+
+
+def _assert_primary(window, expected):
+    buttons = (window.open_button, window.send_button)
+    assert [button for button in buttons if button.property("primary")] == [expected]
+
+
+def test_status_uses_opened_parameters_and_clears_on_close(window, controller):
+    _assert_primary(window, window.open_button)
+    window.baud_combo.setEditText("460800")
+    window.data_bits_combo.setCurrentText("7")
+    window.parity_combo.setCurrentText("E")
+    window.stop_bits_combo.setCurrentText("1.5")
+    _open(window)
+    _assert_primary(window, window.send_button)
+    expected = "已连接 COM3 · 460800 / 7E1.5"
+    assert window.connection_status_label.text() == expected
+
+    # 参数下拉框不能代表已建立的连接：轮询会移除暂时消失的端口。
+    controller.ports = ["COM4"]
+    window._monitor.tick()
+    assert window.port_combo.currentText() != "COM3"
+    window.parse_mode_combo.setCurrentText("原始字节")
+    assert window.connection_status_label.text() == expected
+    label = window.connection_status_label
+    label.ensurePolished()
+    assert label.palette().color(QPalette.ColorRole.WindowText) == QColor(COLORS["success"])
+
+    window.open_button.click()
+    assert label.text() == "未连接"
+    _assert_primary(window, window.open_button)
+    label.ensurePolished()
+    assert label.palette().color(QPalette.ColorRole.WindowText) == QColor(COLORS["secondary"])
+    assert not window.send_button.isEnabled()
+
+
+@pytest.mark.parametrize("cause", ["open_failure", "read_failure", "write_failure", "port_lost"])
+def test_failures_restore_disconnected_status_and_primary(
+    window, controller, dialogs, monkeypatch, cause
+):
+    if cause == "open_failure":
+        controller.open_exc = OSError("端口被占用")
+        window.open_button.click()
+    else:
+        _open(window)
+        if cause == "read_failure":
+            controller.error_queue.put(OSError("读失败"))
+            window._drain_queues()
+        elif cause == "write_failure":
+            def fail_write(data):
+                raise OSError("写失败")
+            monkeypatch.setattr(controller, "write", fail_write)
+            window.send_edit.setText("hello")
+            window.send_button.click()
+        else:
+            controller.ports = []
+            window._monitor.tick()
+            window._monitor.tick()
+    assert window.connection_status_label.text() == "未连接"
+    _assert_primary(window, window.open_button)
+    assert dialogs["critical"] or dialogs["warning"]
+
+
+def test_reopen_replaces_connection_status_without_old_port(window):
+    _open(window)
+    window.open_button.click()
+    window.port_combo.setCurrentText("COM4")
+    window.baud_combo.setEditText("9600")
+    _open(window)
+    assert window.connection_status_label.text() == "已连接 COM4 · 9600 / 8N1"
+    _assert_primary(window, window.send_button)
+
+
+def test_receive_diagnostic_is_hidden_until_error_and_hidden_after_clear(window, controller):
+    assert window.receive_error_label.isHidden()
+    controller.diagnostic_queue.put("接收帧超过 1 MiB，已丢弃")
+    window._drain_queues()
+    assert not window.receive_error_label.isHidden()
+    window.clear_button.click()
+    assert window.receive_error_label.text() == ""
+    assert window.receive_error_label.isHidden()
+
+
+@pytest.mark.parametrize("raw", [False, True])
+def test_status_labels_fit_small_window_after_connection(window, qapp, raw):
+    window.resize(760, 480)
+    window.show()
+    _open(window)
+    if raw:
+        window.parse_mode_combo.setCurrentText("原始字节")
+    qapp.processEvents()
+    bar = _rect_in_window(window, window.statusBar())
+    connection = _rect_in_window(window, window.connection_status_label)
+    receive = _rect_in_window(window, window.receive_status_label)
+    assert window.size() == QSize(760, 480)
+    assert bar.contains(connection)
+    assert bar.contains(receive)
+    assert not connection.intersects(receive)
+    for label in (window.connection_status_label, window.receive_status_label):
+        assert label.height() >= label.heightForWidth(label.width())
 
 
 # ---------- 端口枚举 ----------
@@ -490,7 +759,7 @@ def test_append_scrolls_to_end(qtbot, window, controller):
 
 
 def test_rerender_keeps_end_visible(qtbot, window, controller):
-    """切换文本/HEX 或编码导致全量重渲染后，仍保持末尾可见。"""
+    """跟随开启时切换文本/HEX 或编码仍保持末尾可见。"""
     _feed_many_lines(window, controller)
     sb = window.display_edit.verticalScrollBar()
     qtbot.waitUntil(lambda: sb.maximum() > 0, timeout=2000)
@@ -507,6 +776,203 @@ def test_rerender_keeps_end_visible(qtbot, window, controller):
     _select(window.encoding_combo, "GBK")
     qtbot.waitUntil(lambda: sb.maximum() > 0, timeout=2000)
     assert sb.value() == sb.maximum()
+
+
+def test_follow_latest_pauses_when_user_scrolls_and_resumes_on_click(qtbot, window, controller):
+    _feed_many_lines(window, controller)
+    button = window.follow_latest_button
+    sb = window.display_edit.verticalScrollBar()
+    assert button.isChecked()
+    assert button.text() == "跟随最新"
+
+    paused_value = max(0, sb.maximum() - 3)
+    sb.setSliderPosition(paused_value)  # 模拟用户拖动滚动条
+    qtbot.waitUntil(lambda: not button.isChecked())
+    assert button.text() == "回到最新"
+
+    controller.received_queue.put(_event("paused-line"))
+    window._drain_queues()
+    assert not button.isChecked()
+    assert sb.value() == paused_value
+    assert "paused-line" in window.display_edit.toPlainText()
+
+    button.click()
+    assert button.isChecked()
+    assert button.text() == "跟随最新"
+    assert sb.value() == sb.maximum()
+
+    controller.received_queue.put(_event("latest-line"))
+    window._drain_queues()
+    assert sb.value() == sb.maximum()
+
+
+def test_follow_button_can_pause_at_bottom_without_stopping_receive_or_log(
+    qtbot, window, controller
+):
+    _feed_many_lines(window, controller)
+    button = window.follow_latest_button
+    sb = window.display_edit.verticalScrollBar()
+    button.click()
+    assert not button.isChecked()
+    paused_value = sb.value()
+
+    controller.received_queue.put(_event("bottom-paused"))
+    window._drain_queues()
+    assert sb.value() == paused_value
+    assert "bottom-paused" in window.display_edit.toPlainText()
+
+
+def test_follow_latest_keeps_selections_during_new_data(qtbot, window, controller):
+    _feed_many_lines(window, controller)
+    sb = window.display_edit.verticalScrollBar()
+    sb.setSliderPosition(max(0, sb.maximum() // 2))
+    qtbot.waitUntil(lambda: not window.follow_latest_button.isChecked())
+    cursor = window.display_edit.textCursor()
+    cursor.setPosition(20)
+    cursor.setPosition(32, cursor.MoveMode.KeepAnchor)
+    window.display_edit.setTextCursor(cursor)
+    selected = window.display_edit.textCursor().selectedText()
+    paused_value = sb.value()
+
+    controller.received_queue.put(_event("selection-tail"))
+    window._drain_queues()
+    assert not window.follow_latest_button.isChecked()
+    assert sb.value() == paused_value
+    assert window.display_edit.textCursor().selectedText() == selected
+
+
+def test_follow_latest_remembers_pause_position_per_parse_mode(qtbot, window, controller):
+    _feed_many_lines(window, controller)
+    framed_scrollbar = window.display_edit.verticalScrollBar()
+    framed_scrollbar.setSliderPosition(max(0, framed_scrollbar.maximum() // 3))
+    qtbot.waitUntil(lambda: not window.follow_latest_button.isChecked())
+    framed_value = framed_scrollbar.value()
+
+    _select(window.parse_mode_combo, "原始字节")
+    controller.raw_queue.put(b"raw-" + b"x" * 4000)
+    window._drain_queues()
+    raw_scrollbar = window.display_edit.verticalScrollBar()
+    raw_scrollbar.setSliderPosition(max(0, raw_scrollbar.maximum() // 4))
+    raw_value = raw_scrollbar.value()
+    _select(window.parse_mode_combo, "按 \\r\\n 分帧")
+    assert not window.follow_latest_button.isChecked()
+    assert window.display_edit.verticalScrollBar().value() == framed_value
+    _select(window.parse_mode_combo, "原始字节")
+    assert not window.follow_latest_button.isChecked()
+    assert window.display_edit.verticalScrollBar().value() == raw_value
+
+
+def test_follow_latest_reanchors_to_bottom_after_following_resize(qtbot, window, controller):
+    _feed_many_lines(window, controller)
+    window.resize(800, 240)
+    window.show()
+    window.display_edit.verticalScrollBar().setValue(
+        window.display_edit.verticalScrollBar().maximum()
+    )
+    window.resize(400, 200)
+    qtbot.wait(50)
+    scrollbar = window.display_edit.verticalScrollBar()
+    assert window.follow_latest_button.isChecked()
+    assert scrollbar.value() == scrollbar.maximum()
+
+
+def test_follow_latest_rerender_keeps_pause_and_clears_incompatible_selection(
+    qtbot, window, controller
+):
+    _feed_many_lines(window, controller)
+    sb = window.display_edit.verticalScrollBar()
+    sb.setSliderPosition(max(0, sb.maximum() // 2))
+    qtbot.waitUntil(lambda: not window.follow_latest_button.isChecked())
+    cursor = window.display_edit.textCursor()
+    cursor.setPosition(20)
+    cursor.setPosition(32, cursor.MoveMode.KeepAnchor)
+    window.display_edit.setTextCursor(cursor)
+    _select(window.receive_mode_combo, "HEX")
+    assert not window.follow_latest_button.isChecked()
+    assert sb.value() < sb.maximum()
+    _select(window.encoding_combo, "GBK")
+    assert not window.follow_latest_button.isChecked()
+    assert sb.value() < sb.maximum()
+
+
+def test_clear_resets_follow_latest_and_discards_pause(qtbot, window, controller):
+    _feed_many_lines(window, controller)
+    sb = window.display_edit.verticalScrollBar()
+    sb.setSliderPosition(max(0, sb.maximum() // 2))
+    qtbot.waitUntil(lambda: not window.follow_latest_button.isChecked())
+    window.clear_button.click()
+    assert window.follow_latest_button.isChecked()
+    assert window.follow_latest_button.text() == "跟随最新"
+    assert window.display_edit.toPlainText() == ""
+    controller.received_queue.put(_event("after-clear"))
+    window._drain_queues()
+    assert sb.value() == sb.maximum()
+
+
+def test_follow_latest_first_visit_to_unrecorded_mode_shows_end_but_stays_paused(
+    qtbot, window, controller
+):
+    """A12：暂停时首次进入没有位置记录的模式，显示该模式末尾但仍保持暂停。"""
+    _feed_many_lines(window, controller)
+    framed_sb = window.display_edit.verticalScrollBar()
+    qtbot.waitUntil(lambda: framed_sb.maximum() > 0, timeout=2000)
+    framed_sb.setSliderPosition(max(0, framed_sb.maximum() // 3))
+    qtbot.waitUntil(lambda: not window.follow_latest_button.isChecked())
+
+    # 原始字节历史先积累数据，但从未作为显示模式出现过（无位置记录）。
+    controller.raw_queue.put(b"raw-" + b"x" * 4000)
+    window._drain_queues()
+    _select(window.parse_mode_combo, "原始字节")
+
+    raw_sb = window.display_edit.verticalScrollBar()
+    assert raw_sb.maximum() > 0
+    assert not window.follow_latest_button.isChecked()
+    assert window.follow_latest_button.text() == "回到最新"
+    assert raw_sb.value() == raw_sb.maximum()
+
+
+def test_follow_latest_paused_state_survives_height_resize(qtbot, window, controller):
+    """A13：暂停态在窗口尺寸变化后不自动恢复跟随，也不跳到末尾。"""
+    _feed_many_lines(window, controller)
+    sb = window.display_edit.verticalScrollBar()
+    qtbot.waitUntil(lambda: sb.maximum() > 0, timeout=2000)
+    sb.setSliderPosition(max(0, sb.maximum() // 2))
+    qtbot.waitUntil(lambda: not window.follow_latest_button.isChecked())
+    paused_value = sb.value()
+
+    window.resize(400, 160)  # 只缩高度：内容更多行，活动位置应保持
+    qtbot.wait(50)
+
+    assert not window.follow_latest_button.isChecked()
+    assert window.follow_latest_button.text() == "回到最新"
+    assert sb.value() == paused_value
+    assert sb.value() < sb.maximum()
+
+
+def test_paused_scroll_still_writes_events_to_log(qtbot, mw, controller, tmp_path):
+    """A14：暂停跟随不影响日志写入，事件照常落盘。"""
+    fixed_ms = 1_789_795_153_723
+    log_dir = tmp_path / "logs"
+    log_service = ReceiveLogService(
+        log_dir,
+        date_from_ms=lambda _ms: date(2026, 9, 19),
+    )
+    window = mw.MainWindow(controller=controller, log_service=log_service)
+    qtbot.addWidget(window)
+    window.timestamp_checkbox.setChecked(False)
+    _feed_many_lines(window, controller)
+    sb = window.display_edit.verticalScrollBar()
+    qtbot.waitUntil(lambda: sb.maximum() > 0, timeout=2000)
+    sb.setSliderPosition(max(0, sb.maximum() // 2))
+    qtbot.waitUntil(lambda: not window.follow_latest_button.isChecked())
+
+    event = _event("logged-while-paused", ms=fixed_ms)
+    controller.received_queue.put(event)
+    window._drain_queues()
+
+    assert "logged-while-paused" in window.display_edit.toPlainText()
+    log_text = (log_dir / "2026-09-19.txt").read_text(encoding="utf-8")
+    assert event.raw_frame.hex(" ").upper() in log_text
 
 
 # ---------- 发送 ----------

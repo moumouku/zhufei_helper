@@ -127,6 +127,54 @@ def test_selecting_raw_mode_asks_the_controller_for_raw_receipt(raw_window, cont
     assert controller.raw_mode is False
 
 
+# ---------- 模式提示不进入正文 ----------
+
+
+def test_framed_placeholder_is_not_received_text(window):
+    hint = window.display_edit.placeholderText()
+    assert "等待完整帧" in hint
+    assert "\\r\\n" in hint
+    assert "原始字节" in hint
+    assert window.display_edit.toPlainText() == ""
+    assert window.display_edit.document().isEmpty()
+
+
+def test_raw_hint_and_disabled_timestamp_reason_follow_mode(window):
+    window.timestamp_checkbox.setChecked(False)
+    _select(window.parse_mode_combo, RAW_MODE)
+    assert "收到即显示" in window.display_edit.placeholderText()
+    assert "不记录日志" in window.display_edit.placeholderText()
+    assert "时间戳" in window.timestamp_checkbox.toolTip()
+    assert "原始字节" in window.timestamp_checkbox.toolTip()
+    assert not window.timestamp_checkbox.isEnabled()
+    assert not window.timestamp_checkbox.isChecked()
+    assert window.display_edit.toPlainText() == ""
+
+    _select(window.parse_mode_combo, FRAMED_MODE)
+    assert window.timestamp_checkbox.isEnabled()
+    assert not window.timestamp_checkbox.isChecked()
+    assert "原始字节" not in window.timestamp_checkbox.toolTip()
+    assert "等待完整帧" in window.display_edit.placeholderText()
+
+
+@pytest.mark.parametrize("mode", [FRAMED_MODE, RAW_MODE])
+def test_clear_restores_empty_placeholder_without_logging_it(
+    window, controller, tmp_path, mode
+):
+    _select(window.parse_mode_combo, mode)
+    if mode == RAW_MODE:
+        controller.raw_queue.put(b"hello")
+    else:
+        controller.received_queue.put(FakeEvent(0, b"hello", b"hello\r\n"))
+    window._drain_queues()
+    assert "hello" in window.display_edit.toPlainText()
+    logs = _log_text(tmp_path)
+    window.clear_button.click()
+    assert window.display_edit.document().isEmpty()
+    assert window.display_edit.placeholderText()
+    assert _log_text(tmp_path) == logs
+
+
 # ---------- 原始字节显示 ----------
 
 

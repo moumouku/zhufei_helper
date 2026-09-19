@@ -27,6 +27,7 @@ from paimon_assistant.serial_controller import (  # noqa: E402
     SerialController,
     SerialSettings,
 )
+from paimon_assistant.theme import COLORS  # noqa: E402
 
 #: 固定“今天”的本地时间（日志清理/日期文件的确定性基准）。
 TODAY = datetime(2026, 5, 17, 9, 12, 3)
@@ -517,7 +518,7 @@ def test_ac13_log_failure_shows_red_label_logs_and_keeps_receiving(
         label = window.log_error_label
         assert label.objectName() == "log_error_label"
         assert label.text() == "日志写入失败，请检查磁盘空间或权限"
-        assert "red" in label.styleSheet()
+        assert COLORS["error"] in label.styleSheet()
         assert [r.levelno for r in caplog.records] == [logging.ERROR]
         assert "Receive log write failed" in caplog.text
 
