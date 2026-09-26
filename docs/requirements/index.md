@@ -10,3 +10,4 @@
 | REQ-0002 | 派蒙助手：串口热插拔自动监测 | 已确认 | 2026-08-20 | [REQ-0002-serial-port-monitor.md](REQ-0002-serial-port-monitor.md) |
 | REQ-0003 | 派蒙助手：串口接收事件、时间戳与日志 | 已确认 | 2026-09-02 | [REQ-0003-serial-receive-event-timestamp-log.md](REQ-0003-serial-receive-event-timestamp-log.md) |
 | REQ-0004 | 派蒙助手：接收解析模式选择（协议分帧 / 原始字节） | 已确认 | 2026-09-17 | [REQ-0004-receive-parse-mode.md](REQ-0004-receive-parse-mode.md) |
+| REQ-0005 | 派蒙助手：独立示波器页面与整数波形协议 | 已确认 | 2026-09-23 | [REQ-0005-oscilloscope.md](REQ-0005-oscilloscope.md) |
