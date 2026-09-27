@@ -83,7 +83,7 @@ def test_build_chart_segments_keeps_ordered_min_max_per_pixel_bucket():
     assert points == before, "降采样不得改写原始采样输入"
 
 
-def test_build_chart_segments_preserves_raw_points_gaps_and_view_clipping():
+def test_build_chart_segments_preserves_raw_points_gaps_and_adjacent_context():
     first = [(0.0, 1), (1.0, 2), (2.0, 3)]
     second = [(4.0, 4)]  # 短帧造成的真实缺口，必须保持独立分段
 
@@ -92,9 +92,12 @@ def test_build_chart_segments_preserves_raw_points_gaps_and_view_clipping():
     )
 
     assert segments == [
-        [(1.0, 2), (2.0, 3)],
+        [(0.0, 1), (1.0, 2), (2.0, 3)],
         [(4.0, 4)],
-    ], "视口足够宽时透传原始点，并按缺口保持分段且不跨缺口连接"
+    ], (
+        "视口足够宽时透传原始点；左侧相邻端点用于画出穿越视口的连线，"
+        "缺口仍保持独立分段且不跨缺口连接"
+    )
 
 
 def test_fit_x_range_covers_retained_times_and_broadens_degenerate_views():
@@ -191,14 +194,15 @@ def test_return_to_latest_moves_x_to_latest_keeps_y_and_resumes_following(qtbot)
     page.chart_latest_button.click()
 
     assert page.chart_following is True
-    assert page.x_view_range() == pytest.approx((0.0, 20.0))
+    # issue 018 修正：回到最新是移动视口，保留用户手动选择的 X 宽度。
+    assert page.x_view_range() == pytest.approx((10.0, 20.0))
     assert page.y_view_range() == pytest.approx((100.0, 200.0)), (
         "回到最新只移动 X 视口，不得隐式执行 Y 自动缩放"
     )
 
     page.consume_events([frame(clock, 30_000_000_000, b"4")])
-    assert page.x_view_range() == pytest.approx((0.0, 30.0)), (
-        "恢复跟随后 X 视口随最新保留数据推进"
+    assert page.x_view_range() == pytest.approx((20.0, 30.0)), (
+        "恢复跟随后以保留的手动宽度跟随最新数据"
     )
     assert page.y_view_range() == pytest.approx((100.0, 200.0))
 
@@ -267,9 +271,12 @@ def test_history_eviction_clamps_manual_view_and_shows_nonmodal_hint(qtbot):
 
     page.return_to_latest()
     assert page.history_hint_label.isHidden()
+    assert page.x_view_range() == pytest.approx((200.0, 250.0)), (
+        "回到最新保留手动 X 宽度 50 s，右缘移动到最新采样"
+    )
 
     page.consume_events([frame(clock, 260_000_000_000, b"5")])
-    assert page.x_view_range() == pytest.approx((100.0, 260.0))
+    assert page.x_view_range() == pytest.approx((210.0, 260.0))
 
 
 # --------------------------------- 页面：尺寸重绘 / 图例 / 清空 / 资源失败

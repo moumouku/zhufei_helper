@@ -27,6 +27,9 @@ DEFAULT_Y_MAX = 1.0
 #: 单点/常值时间数据的默认 X 跨度（秒），保证视口不为零宽。
 MIN_VISIBLE_X_SPAN = 1.0
 
+#: 手动缩放允许的最小轴跨度；反复放大后仍须非零、非反向。
+MIN_ZOOM_SPAN = 1e-9
+
 #: ``(relative_seconds, value)``；value 始终是原始 int32，不插值。
 Point = tuple[float, int]
 Segment = list[Point]
@@ -50,14 +53,51 @@ def build_chart_segments(
     bucket_width = (x_max - x_min) / pixel_width
     result: list[Segment] = []
     for segment in segments:
-        visible = [point for point in segment if x_min <= point[0] <= x_max]
-        if not visible:
-            continue
-        if len(visible) <= pixel_width:
-            result.append(visible)
-            continue
-        result.append(_bucket_min_max(visible, x_min, bucket_width, pixel_width))
+        rendered = _render_segment(
+            segment, x_min, x_max, bucket_width, pixel_width
+        )
+        if rendered:
+            result.append(rendered)
     return result
+
+
+def _render_segment(
+    segment: Sequence[Point],
+    x_min: float,
+    x_max: float,
+    bucket_width: float,
+    pixel_width: int,
+) -> Segment:
+    """视口内的分段点，加上两侧相邻原始端点。
+
+    相邻端点只来自同一分段，因此稀疏分段可以画出穿越视口的连线，而短帧
+    缺口两侧仍是两个分段，不可能被连接。分段完全在视口一侧时返回空。
+    """
+    visible: Segment = []
+    left: Point | None = None
+    right: Point | None = None
+    for point in segment:
+        if point[0] < x_min:
+            left = point
+        elif point[0] > x_max:
+            right = point
+            break
+        else:
+            visible.append(point)
+    if not visible and (left is None or right is None):
+        return []
+    core = (
+        visible
+        if len(visible) <= pixel_width
+        else _bucket_min_max(visible, x_min, bucket_width, pixel_width)
+    )
+    rendered: Segment = []
+    if left is not None:
+        rendered.append(left)
+    rendered.extend(core)
+    if right is not None:
+        rendered.append(right)
+    return rendered
 
 
 def _clip_segments(segments: Segments, x_min: float, x_max: float) -> list[Segment]:
@@ -71,33 +111,45 @@ def _clip_segments(segments: Segments, x_min: float, x_max: float) -> list[Segme
 def _bucket_min_max(
     visible: list[Point], x_min: float, bucket_width: float, pixel_width: int
 ) -> Segment:
-    """每个像素桶保留 (最早, 最晚) 情形下的最小/最大值，按时间排序。"""
+    """每个像素桶保留最小/最大值，按原始输入顺序输出时间戳相同的一对点。"""
     bucketed: Segment = []
     current_index: int | None = None
     lowest: Point | None = None
     highest: Point | None = None
-    for point in visible:
+    lowest_order = highest_order = 0
+    for order, point in enumerate(visible):
         index = min(int((point[0] - x_min) / bucket_width), pixel_width - 1)
         if index != current_index:
             if current_index is not None:
-                bucketed.extend(_ordered_min_max(lowest, highest))
+                bucketed.extend(
+                    _ordered_min_max(lowest, highest, lowest_order, highest_order)
+                )
             current_index = index
             lowest = highest = point
+            lowest_order = highest_order = order
             continue
         if point[1] < lowest[1]:  # type: ignore[index]
             lowest = point
+            lowest_order = order
         if point[1] > highest[1]:  # type: ignore[index]
             highest = point
-    bucketed.extend(_ordered_min_max(lowest, highest))
+            highest_order = order
+    bucketed.extend(_ordered_min_max(lowest, highest, lowest_order, highest_order))
     return bucketed
 
 
-def _ordered_min_max(lowest: Point | None, highest: Point | None) -> Segment:
+def _ordered_min_max(
+    lowest: Point | None,
+    highest: Point | None,
+    lowest_order: int = 0,
+    highest_order: int = 0,
+) -> Segment:
     if lowest is None or highest is None:
         return []
     if lowest is highest:  # 同一桶内的同一个点
         return [lowest]
-    if lowest[0] <= highest[0]:
+    # 用出现顺序而不是时间值比较：相同时间戳也保留原始输入顺序。
+    if lowest_order <= highest_order:
         return [lowest, highest]
     return [highest, lowest]
 
@@ -105,18 +157,19 @@ def _ordered_min_max(lowest: Point | None, highest: Point | None) -> Segment:
 def fit_x_range(samples: Iterable[object]) -> tuple[float, float]:
     """X range covering every retained sample; never zero-width.
 
-    A single sample (or several identical times) is centered in a
-    ``MIN_VISIBLE_X_SPAN`` window, clamped to ``>= 0`` because relative time
-    starts at ``T+0``. Empty data yields the legal default view.
+    Distinct sample times keep their exact extent even when the span is below
+    ``MIN_VISIBLE_X_SPAN``; only a single time (or several identical times) is
+    centered in a ``MIN_VISIBLE_X_SPAN`` window, clamped to ``>= 0`` because
+    relative time starts at ``T+0``. Empty data yields the legal default view.
     """
     times = [float(getattr(item, "relative_seconds")) for item in samples]
     if not times:
         return DEFAULT_X_MIN, DEFAULT_X_MAX
     low, high = min(times), max(times)
-    if high - low >= MIN_VISIBLE_X_SPAN:
+    if high > low:
         return low, high
-    start = (low + high) / 2 - MIN_VISIBLE_X_SPAN / 2
-    start = max(DEFAULT_X_MIN, start)
+    # 全部采样时间相同：退化视口需要合法非零宽度，其余情况必须精确覆盖。
+    start = max(DEFAULT_X_MIN, low - MIN_VISIBLE_X_SPAN / 2)
     return start, start + MIN_VISIBLE_X_SPAN
 
 
@@ -181,3 +234,65 @@ def keep_x_span_in_range(
         if high <= low:
             low, high = retained_min, retained_max
     return low, high
+
+
+def zoom_range(
+    x_min: float,
+    x_max: float,
+    factor: float,
+    anchor: float,
+    lower: float,
+    upper: float,
+) -> tuple[float, float]:
+    """Scale a range around ``anchor``, clamped to ``[lower, upper]``.
+
+    ``factor < 1`` zooms in. Moving the anchor outside the current range is
+    clamped to the range; the resulting span is never zero nor inverted and
+    never leaves the hard bounds. The pointer anchor is preserved unless the
+    bound would be crossed.
+    """
+    span = x_max - x_min
+    if span <= 0.0 or factor <= 0.0 or upper <= lower:
+        return x_min, x_max
+    anchor = min(max(anchor, x_min), x_max)
+    bound_span = upper - lower
+    new_span = span * factor
+    if new_span < MIN_ZOOM_SPAN:
+        new_span = min(MIN_ZOOM_SPAN, bound_span)
+    if new_span >= bound_span:
+        return lower, upper
+    new_min = anchor - (anchor - x_min) / span * new_span
+    new_max = new_min + new_span
+    if new_min < lower:
+        new_max += lower - new_min
+        new_min = lower
+    if new_max > upper:
+        new_min -= new_max - upper
+        new_max = upper
+    if new_min < lower:
+        return lower, upper
+    return new_min, new_max
+
+
+def shift_range(
+    value_min: float, value_max: float, delta: float, lower: float, upper: float
+) -> tuple[float, float]:
+    """Translate a nonzero-width range by ``delta``, clamped to hard bounds.
+
+    Used by Y pan: the range keeps its width when it fits inside the bounds
+    and degrades to the whole bound when it is wider.
+    """
+    span = value_max - value_min
+    if span <= 0.0 or upper <= lower:
+        return value_min, value_max
+    if span >= upper - lower:
+        return lower, upper
+    new_min = value_min + delta
+    new_max = value_max + delta
+    if new_min < lower:
+        new_max += lower - new_min
+        new_min = lower
+    if new_max > upper:
+        new_min -= new_max - upper
+        new_max = upper
+    return new_min, new_max

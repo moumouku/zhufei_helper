@@ -13,7 +13,15 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
-from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QPoint,
+    QPointF,
+    QSignalBlocker,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -33,6 +41,7 @@ from .oscilloscope import (
     OscilloscopeSession,
     format_connection_boundary_line,
     format_frame_line,
+    format_relative_seconds,
 )
 from .oscilloscope_chart import (
     DEFAULT_X_MAX,
@@ -44,8 +53,82 @@ from .oscilloscope_chart import (
     fit_x_range,
     fit_y_range,
     keep_x_span_in_range,
+    shift_range,
+    zoom_range,
 )
 from .theme import CHANNEL_COLORS, COLORS, SIZES, data_font
+
+#: 可见 +/- 按钮与滚轮的每级缩放倍率；factor<1 为放大（跨度变小）。
+ZOOM_STEP = 1.25
+
+#: 悬停邻近判定阈值（屏幕/视口像素）；附近必须有真实原始采样点。
+HOVER_DISTANCE_PX = 8.0
+
+#: 事件修饰键以 int 信号传递（PySide6 的 KeyboardModifier 不可直接 int()）。
+_CTRL_MODIFIER = Qt.KeyboardModifier.ControlModifier.value
+_SHIFT_MODIFIER = Qt.KeyboardModifier.ShiftModifier.value
+
+
+class OscilloscopeChartView(QChartView):
+    """图表视图：把原生滚轮/鼠标/尺寸事件转成页面可测的交互信号。
+
+    不继承 QGraphicsView 的默认滚轮滚动，所有交互都围绕图表轴坐标处理；
+    页面负责坐标映射和轴夹紧，信号只携带 viewport 像素位置与修饰键。
+    """
+
+    wheel_zoom_requested = Signal(float, float, float, int)
+    pan_started = Signal(float, float, int)
+    pointer_moved = Signal(float, float)
+    pan_finished = Signal()
+    pointer_left = Signal()
+    view_resized = Signal()
+
+    def __init__(self, chart, parent=None) -> None:
+        super().__init__(chart, parent)
+        # 无按键悬停也要收到 mouseMoveEvent；viewport 是实际接收事件的子控件。
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        delta = float(event.angleDelta().y())
+        if delta:
+            position = event.position()
+            self.wheel_zoom_requested.emit(
+                delta, position.x(), position.y(), event.modifiers().value
+            )
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            position = event.position()
+            self.pan_started.emit(
+                position.x(), position.y(), event.modifiers().value
+            )
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        position = event.position()
+        self.pointer_moved.emit(position.x(), position.y())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton:
+            self.pan_finished.emit()
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        self.pointer_left.emit()
+        super().leaveEvent(event)
+
+    def viewportEvent(self, event) -> bool:  # noqa: N802
+        # 真实鼠标离开通常由 viewport 收到 Leave；leaveEvent 只覆盖视图本身。
+        if event.type() == QEvent.Type.Leave:
+            self.pointer_left.emit()
+        return super().viewportEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self.view_resized.emit()
 
 
 class OscilloscopePage(QWidget):
@@ -68,6 +151,14 @@ class OscilloscopePage(QWidget):
         self._follow_latest = True
         #: 图表是否跟随最新数据；手动缩放/平移后关闭，与数据区跟随互相独立。
         self._chart_following = True
+        #: 用户手动选择的 X 宽度；None 表示跟随态适配全部保留范围。
+        self._manual_x_span: float | None = None
+        #: 首个有效帧到达时是否还需要适配初始 Y；清空/新建采集重置。
+        self._initial_y_pending = True
+        #: 左键拖动状态：起始修饰键决定平移哪些轴，上一图表值用于增量。
+        self._dragging = False
+        self._drag_axes = (False, False)
+        self._drag_last_value = None
         #: 绘图资源失败后保持原始历史但不再重试绘制；由主窗口负责关闭串口。
         self._resource_failed = False
         #: 可注入的绘图函数，测试资源失败路径时不依赖真实内存耗尽。
@@ -79,7 +170,6 @@ class OscilloscopePage(QWidget):
         self._scroll_anchor_value = None
         self._chart_rerender_pending = False
         self._build_ui()
-        self.chart_view.installEventFilter(self)
         self._connect_signals()
 
     # ------------------------------------------------------------- public
@@ -133,6 +223,7 @@ class OscilloscopePage(QWidget):
                 self._ensure_channel_row(index)
                 self._update_channel_value(f"CH{index + 1}", value)
         self._sync_view_for_data()
+        self._fit_initial_y(new_legal)
         self._render_chart_guarded()
 
     # ------------------------------------------------------- view access
@@ -148,6 +239,49 @@ class OscilloscopePage(QWidget):
     def y_view_range(self) -> tuple[float, float]:
         return (self.axis_y.min(), self.axis_y.max())
 
+    def zoom_x(self, factor: float, anchor: float | None = None) -> None:
+        """围绕图表 X 坐标 ``anchor`` 缩放 X 轴；缺省以视口中心为中心。
+
+        ``factor < 1`` 放大（跨度变小）。结果始终夹紧在仍保留的时间窗内，
+        非零且非反向；只要应用就退出实时跟随。
+        """
+        if not math.isfinite(factor) or factor <= 0.0:
+            return
+        x_min, x_max = self.x_view_range()
+        samples = self.session.samples
+        retained = (
+            fit_x_range(samples) if samples else (DEFAULT_X_MIN, DEFAULT_X_MAX)
+        )
+        if anchor is None:
+            anchor = (x_min + x_max) / 2.0
+        if not math.isfinite(anchor):
+            return
+        new_x = zoom_range(x_min, x_max, factor, anchor, retained[0], retained[1])
+        if new_x[1] <= new_x[0]:
+            return
+        self.axis_x.setRange(*new_x)
+        self._manual_x_span = new_x[1] - new_x[0]
+        self._chart_following = False
+        self._set_history_hint(False)
+        self._render_chart_guarded()
+
+    def zoom_y(self, factor: float, anchor: float | None = None) -> None:
+        """围绕图表 Y 坐标 ``anchor`` 缩放 Y 轴；夹紧在 int32 硬范围。"""
+        if not math.isfinite(factor) or factor <= 0.0:
+            return
+        y_min, y_max = self.y_view_range()
+        if anchor is None:
+            anchor = (y_min + y_max) / 2.0
+        if not math.isfinite(anchor):
+            return
+        new_y = zoom_range(y_min, y_max, factor, anchor, INT32_MIN, INT32_MAX)
+        if new_y[1] <= new_y[0]:
+            return
+        self.axis_y.setRange(*new_y)
+        self._initial_y_pending = False
+        self._chart_following = False
+        self._render_chart_guarded()
+
     def auto_scale(self) -> None:
         """一次性把 X 适配保留采样范围，并只按可见 X 内开启通道计算 Y。"""
         x_min, x_max = fit_x_range(self.session.samples)
@@ -158,15 +292,28 @@ class OscilloscopePage(QWidget):
         ]
         self.axis_x.setRange(x_min, x_max)
         self.axis_y.setRange(*fit_y_range(enabled_segments, x_min, x_max))
+        self._manual_x_span = None
+        self._initial_y_pending = False
         self._set_history_hint(False)
         self._render_chart_guarded()
 
     def return_to_latest(self) -> None:
-        """把 X 视口移回最新保留数据并恢复实时跟随；不隐式缩放 Y。"""
+        """把 X 视口移回最新保留数据并恢复实时跟随；不隐式缩放 Y。
+
+        保留用户手动选定的 X 宽度（§8.6 的“移动”而不是自动缩放全部）；
+        从未手动选过宽度时仍适配全部保留范围。
+        """
         self._chart_following = True
         samples = self.session.samples
         if samples:
-            self.axis_x.setRange(*fit_x_range(samples))
+            retained = fit_x_range(samples)
+            if self._manual_x_span is None:
+                self.axis_x.setRange(*retained)
+            else:
+                shifted = keep_x_span_in_range(
+                    retained[1] - self._manual_x_span, retained[1], *retained
+                )
+                self.axis_x.setRange(*shifted)
         self._set_history_hint(False)
         self._render_chart_guarded()
 
@@ -203,7 +350,9 @@ class OscilloscopePage(QWidget):
             if y_high <= y_low:
                 return
             self.axis_y.setRange(y_low, y_high)
+            self._initial_y_pending = False
         self.axis_x.setRange(*new_x)
+        self._manual_x_span = new_x[1] - new_x[0]
         self._chart_following = False
         self._set_history_hint(False)
         self._render_chart_guarded()
@@ -221,13 +370,19 @@ class OscilloscopePage(QWidget):
             self._begin_scroll_settle()
 
     def _sync_view_for_data(self) -> None:
-        """新数据后的 X 视口：跟随则适配保留范围，手动则夹紧不越界。"""
+        """新数据后的 X 视口：跟随则适配/滑动保留范围，手动则夹紧不越界。"""
         samples = self.session.samples
         if not samples:
             return
         retained = fit_x_range(samples)
         if self._chart_following:
-            self.axis_x.setRange(*retained)
+            if self._manual_x_span is None:
+                self.axis_x.setRange(*retained)
+            else:
+                shifted = keep_x_span_in_range(
+                    retained[1] - self._manual_x_span, retained[1], *retained
+                )
+                self.axis_x.setRange(*shifted)
             self._set_history_hint(False)
             return
         current = self.x_view_range()
@@ -238,8 +393,30 @@ class OscilloscopePage(QWidget):
         else:
             self._set_history_hint(False)
 
+    def _fit_initial_y(self, new_legal) -> None:
+        """首个有效帧到达时把 Y 适配到当前视口内开启通道的真实值。
+
+        保证默认 Y[-1,1] 之外的常规首次采样可见；只做一次，清空/新建
+        采集后重置。用户显式选过 Y 时不覆盖。
+        """
+        if not self._initial_y_pending or not new_legal:
+            return
+        x_min, x_max = self.x_view_range()
+        enabled_segments = [
+            self.session.channel_segments(index)
+            for index in range(self.session.channel_count)
+            if self._channel_enabled(index)
+        ]
+        self.axis_y.setRange(*fit_y_range(enabled_segments, x_min, x_max))
+        self._initial_y_pending = False
+
     def _render_chart_guarded(self) -> None:
-        """绘图失败不丢原始历史：停页并上抛信号，由主窗口关闭连接。"""
+        """绘图失败不丢原始历史：停页并上抛信号，由主窗口关闭连接。
+
+        数据/视口/尺寸变化后旧悬停读值可能已不对应指针位置，必须在
+        重绘时隐藏，避免误解为当前位置数据。
+        """
+        self._hide_hover()
         if self._resource_failed:
             return
         try:
@@ -351,8 +528,11 @@ class OscilloscopePage(QWidget):
         self.show_diagnostic("")
         self._set_follow_latest(True)
         self._chart_following = True
+        self._manual_x_span = None
+        self._initial_y_pending = True
         self._set_history_hint(False)
         self._scroll_anchor_value = None
+        self._hide_hover()
 
     # ---------------------------------------------------------------- UI
 
@@ -375,6 +555,18 @@ class OscilloscopePage(QWidget):
         self.auto_scale_button.setObjectName("oscilloscope_auto_scale_button")
         self.chart_latest_button = QPushButton("回到最新")
         self.chart_latest_button.setObjectName("oscilloscope_chart_latest_button")
+        self.x_zoom_in_button = QPushButton("X+")
+        self.x_zoom_in_button.setObjectName("oscilloscope_x_zoom_in_button")
+        self.x_zoom_in_button.setToolTip("X 轴放大")
+        self.x_zoom_out_button = QPushButton("X-")
+        self.x_zoom_out_button.setObjectName("oscilloscope_x_zoom_out_button")
+        self.x_zoom_out_button.setToolTip("X 轴缩小")
+        self.y_zoom_in_button = QPushButton("Y+")
+        self.y_zoom_in_button.setObjectName("oscilloscope_y_zoom_in_button")
+        self.y_zoom_in_button.setToolTip("Y 轴放大")
+        self.y_zoom_out_button = QPushButton("Y-")
+        self.y_zoom_out_button.setObjectName("oscilloscope_y_zoom_out_button")
+        self.y_zoom_out_button.setToolTip("Y 轴缩小")
         self.state_label = QLabel("未开始")
         self.state_label.setObjectName("oscilloscope_state_label")
         toolbar.addWidget(self.start_button)
@@ -382,6 +574,10 @@ class OscilloscopePage(QWidget):
         toolbar.addWidget(self.follow_button)
         toolbar.addWidget(self.auto_scale_button)
         toolbar.addWidget(self.chart_latest_button)
+        toolbar.addWidget(self.x_zoom_in_button)
+        toolbar.addWidget(self.x_zoom_out_button)
+        toolbar.addWidget(self.y_zoom_in_button)
+        toolbar.addWidget(self.y_zoom_out_button)
         toolbar.addWidget(self.state_label)
         toolbar.addStretch(1)
         root.addLayout(toolbar)
@@ -441,10 +637,20 @@ class OscilloscopePage(QWidget):
         self.channel_checks: dict[str, QCheckBox] = {}
         self.channel_labels: dict[str, QLabel] = {}
         self.ch1_series = self._add_channel_segment(0)
-        self.chart_view = QChartView(self.chart)
+        self.chart_view = OscilloscopeChartView(self.chart)
         self.chart_view.setObjectName("oscilloscope_chart_view")
         self.chart_view.setRenderHint(QPainter.Antialiasing)
         self.chart_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.hover_label = QLabel(self.chart_view)
+        self.hover_label.setObjectName("oscilloscope_hover_label")
+        self.hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hover_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.hover_label.setFont(data_font())
+        self.hover_label.setStyleSheet(
+            f"background-color: {COLORS['panel']}; color: {COLORS['text']};"
+            f" border: 1px solid {COLORS['border']}; padding: 2px 6px;"
+        )
+        self.hover_label.setVisible(False)
         content.addWidget(self.chart_view, 2)
 
         self.channel_panel = QWidget()
@@ -481,6 +687,16 @@ class OscilloscopePage(QWidget):
         self.follow_button.clicked.connect(self._on_follow_clicked)
         self.auto_scale_button.clicked.connect(self.auto_scale)
         self.chart_latest_button.clicked.connect(self.return_to_latest)
+        self.x_zoom_in_button.clicked.connect(lambda: self.zoom_x(1.0 / ZOOM_STEP))
+        self.x_zoom_out_button.clicked.connect(lambda: self.zoom_x(ZOOM_STEP))
+        self.y_zoom_in_button.clicked.connect(lambda: self.zoom_y(1.0 / ZOOM_STEP))
+        self.y_zoom_out_button.clicked.connect(lambda: self.zoom_y(ZOOM_STEP))
+        self.chart_view.wheel_zoom_requested.connect(self._on_wheel_zoom_requested)
+        self.chart_view.pan_started.connect(self._on_pan_started)
+        self.chart_view.pointer_moved.connect(self._on_pointer_moved)
+        self.chart_view.pan_finished.connect(self._on_pan_finished)
+        self.chart_view.pointer_left.connect(self._hide_hover)
+        self.chart_view.view_resized.connect(self._schedule_chart_rerender)
         scrollbar = self.display_edit.verticalScrollBar()
         scrollbar.actionTriggered.connect(self._on_display_scroll_action)
         scrollbar.valueChanged.connect(self._on_display_scroll_changed)
@@ -625,13 +841,168 @@ class OscilloscopePage(QWidget):
         """开关只控制绘制：采样、最新值和缺口分段照常维护。"""
         for series in self.channel_series.get(index, []):
             series.setVisible(visible)
+        # 悬停中的通道被关闭（或没有通道开启）时旧读值立即失效。
+        self._hide_hover()
 
-    def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt override)
-        """图表尺寸变化后按新的像素宽度从原始采样重新生成绘图输入。"""
-        if watched is self.chart_view and event.type() == QEvent.Type.Resize:
-            # plotArea 在 Resize 事件之后才更新，延后到本轮事件循环末尾重绘。
-            self._schedule_chart_rerender()
-        return super().eventFilter(watched, event)
+    def _on_wheel_zoom_requested(
+        self, delta: float, viewport_x: float, viewport_y: float, modifiers: int
+    ) -> None:
+        """滚轮以指针所在图表坐标为锚点；默认 X，Ctrl 只缩放 Y。"""
+        anchor = self._viewport_value(viewport_x, viewport_y)
+        if anchor is None:
+            return
+        factor = 1.0 / ZOOM_STEP if delta > 0 else ZOOM_STEP
+        if modifiers & _CTRL_MODIFIER:
+            self.zoom_y(factor, anchor.y())
+        else:
+            self.zoom_x(factor, anchor.x())
+
+    @staticmethod
+    def _axes_for_modifiers(modifiers: int) -> tuple[bool, bool]:
+        """默认同时平移 X/Y；Shift 只 X，Ctrl 只 Y。"""
+        ctrl = bool(modifiers & _CTRL_MODIFIER)
+        shift = bool(modifiers & _SHIFT_MODIFIER)
+        if ctrl and not shift:
+            return False, True
+        if shift and not ctrl:
+            return True, False
+        return True, True
+
+    def _on_pan_started(
+        self, viewport_x: float, viewport_y: float, modifiers: int
+    ) -> None:
+        self._dragging = True
+        self._drag_axes = self._axes_for_modifiers(modifiers)
+        self._drag_last_value = self._viewport_value(viewport_x, viewport_y)
+        self._hide_hover()
+
+    def _on_pointer_moved(self, viewport_x: float, viewport_y: float) -> None:
+        if not self._dragging:
+            self._update_hover(viewport_x, viewport_y)
+            return
+        if self._drag_last_value is None:
+            self._drag_last_value = self._viewport_value(viewport_x, viewport_y)
+            return
+        current = self._viewport_value(viewport_x, viewport_y)
+        if current is None:
+            return
+        x_delta = self._drag_last_value.x() - current.x()
+        y_delta = self._drag_last_value.y() - current.y()
+        self._drag_last_value = current
+        if x_delta == 0.0 and y_delta == 0.0:
+            return
+        self._apply_pan(x_delta, y_delta)
+
+    def _on_pan_finished(self) -> None:
+        self._dragging = False
+        self._drag_axes = (False, False)
+        self._drag_last_value = None
+
+    def _apply_pan(self, x_delta: float, y_delta: float) -> None:
+        """按起始修饰键平移对应轴；X 夹紧保留窗口，Y 夹紧 int32。"""
+        pan_x, pan_y = self._drag_axes
+        if pan_x:
+            x_min, x_max = self.x_view_range()
+            samples = self.session.samples
+            retained = (
+                fit_x_range(samples) if samples else (DEFAULT_X_MIN, DEFAULT_X_MAX)
+            )
+            new_x = keep_x_span_in_range(
+                x_min + x_delta, x_max + x_delta, retained[0], retained[1]
+            )
+            if new_x[1] > new_x[0]:
+                self.axis_x.setRange(*new_x)
+                self._manual_x_span = new_x[1] - new_x[0]
+        if pan_y:
+            y_min, y_max = self.y_view_range()
+            new_y = shift_range(y_min, y_max, y_delta, INT32_MIN, INT32_MAX)
+            if new_y[1] > new_y[0]:
+                self.axis_y.setRange(*new_y)
+                self._initial_y_pending = False
+        self._chart_following = False
+        self._set_history_hint(False)
+        self._render_chart_guarded()
+
+    def _update_hover(self, viewport_x: float, viewport_y: float) -> None:
+        """在最靠近指针的可见通道真实原始采样上显示整帧读值。
+
+        邻近距离在屏幕/视口尺度上计算，但返回值只能来自 ``session.samples``
+        的原始点；短帧缺失通道不生成虚构读数。没有开启通道、指针远离
+        任何有效原始点时隐藏。
+        """
+        if not self._any_channel_enabled():
+            self._hide_hover()
+            return
+        chart_position = self._viewport_chart_position(viewport_x, viewport_y)
+        if chart_position is None:
+            self._hide_hover()
+            return
+        best_sample = None
+        best_distance = HOVER_DISTANCE_PX
+        for sample in self.session.samples:
+            values = sample.values
+            for index in range(min(len(values), self.session.channel_count)):
+                if not self._channel_enabled(index):
+                    continue
+                pixel = self.chart.mapToPosition(
+                    QPointF(sample.relative_seconds, float(values[index])),
+                    self.ch1_series,
+                )
+                distance = math.hypot(
+                    pixel.x() - chart_position.x(), pixel.y() - chart_position.y()
+                )
+                if distance <= best_distance:
+                    best_distance = distance
+                    best_sample = sample
+        if best_sample is None:
+            self._hide_hover()
+            return
+        self.hover_label.setText(self._format_hover(best_sample))
+        self._position_hover_label(viewport_x, viewport_y)
+        self.hover_label.setVisible(True)
+
+    def _hide_hover(self) -> None:
+        self.hover_label.setVisible(False)
+        self.hover_label.clear()
+
+    def _any_channel_enabled(self) -> bool:
+        return any(check.isChecked() for check in self.channel_checks.values())
+
+    @staticmethod
+    def _format_hover(sample) -> str:
+        """``T+... s`` 加该帧实际存在的全部通道和值。"""
+        fields = "  ".join(
+            f"CH{index + 1}={value}" for index, value in enumerate(sample.values)
+        )
+        return f"{format_relative_seconds(sample.relative_seconds)}  {fields}"
+
+    def _position_hover_label(self, viewport_x: float, viewport_y: float) -> None:
+        self.hover_label.resize(self.hover_label.sizeHint())
+        size = self.hover_label.size()
+        viewport = self.chart_view.viewport()
+        margin = 12
+        left = int(viewport_x) + margin
+        top = int(viewport_y) + margin
+        if left + size.width() > viewport.width():
+            left = max(0, int(viewport_x) - margin - size.width())
+        if top + size.height() > viewport.height():
+            top = max(0, int(viewport_y) - margin - size.height())
+        self.hover_label.move(left, top)
+
+    def _viewport_chart_position(self, viewport_x: float, viewport_y: float):
+        """QChartView viewport 坐标 → QChart 图元坐标；布局未就绪时返回 None。"""
+        area = self.chart.plotArea()
+        if area.width() <= 0.0 or area.height() <= 0.0:
+            return None
+        point = QPoint(int(round(viewport_x)), int(round(viewport_y)))
+        return self.chart.mapFromScene(self.chart_view.mapToScene(point))
+
+    def _viewport_value(self, viewport_x: float, viewport_y: float):
+        """viewport 坐标处的图表值坐标；无法映射时返回 None。"""
+        chart_position = self._viewport_chart_position(viewport_x, viewport_y)
+        if chart_position is None or self.ch1_series is None:
+            return None
+        return self.chart.mapToValue(chart_position, self.ch1_series)
 
     def _schedule_chart_rerender(self) -> None:
         if self._chart_rerender_pending:
