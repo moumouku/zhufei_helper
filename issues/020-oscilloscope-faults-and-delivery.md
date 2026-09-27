@@ -12,7 +12,7 @@ AFK
 
 完成 REQ-0005 的跨功能验收和交付收口。建立覆盖协议、接收所有权、双时间、恢复边界、三分钟存储、绘图交互、清空及日志故障的自动化验收矩阵；验证所有连接和资源异常都恢复一致的串口、消费者与页面锁定状态。保持 REQ-0001～REQ-0004 全量行为，并在 Python 3.10、最低支持 PySide6 6.6、Qt offscreen 和 PyInstaller 路径验证 QtCharts 可用。
 
-功能通过后，将源码版本更新为 `0.6.0`，并同步 README、用户手册和 CHANGELOG。原实施阶段只验证本地 EXE；验收后用户进一步授权同步工作区、清理临时文件，并将可直接下载的 EXE 随集成分支推送。因此当前分支根目录纳入已验证的 v0.6.0 EXE，文档提供下载链接和 SHA256；最新正式 Release 与 `main` 仍为 v0.5.0，本次不创建 v0.6.0 tag 或 GitHub Release。
+功能通过后，将源码版本更新为 `0.6.0`，并同步 README、用户手册和 CHANGELOG。用户随后明确要求固定交付到 `main` 与 `v0.6.0` Tags，并随提交提供可直接下载的 EXE；Branches 只保留 main，GitHub Release 不作为本次必需交付。
 
 ## Acceptance criteria
 
@@ -26,8 +26,8 @@ AFK
 - [x] PyInstaller 干净构建包含 QtCharts，源码和打包程序的 `--smoke-test` 均通过
 - [x] 必要的 Windows 原生 QtCharts 鼠标交互验收步骤明确记录；真实 com0com 验收保持显式启用且不成为普通自动测试前提
 - [x] `README.md` 与 `docs/user-manual.md` 准确说明数据/波形页、接收互斥、十进制数值协议、时间语义、三分钟窗口和图表操作
-- [x] `CHANGELOG.md` 记录 v0.6.0 开发构建的实现与实际验证结果，程序版本信息为 `0.6.0`；README 明确本分支源码/EXE 为 v0.6.0、最新正式 Release 为 v0.5.0，未执行的验收不宣称通过
-- [x] 父需求按用户确认的小数协议和接收正文修订；已验证 EXE 按验收后的授权纳入根目录，SHA256 和直接下载链接同步；保留历史 v0.5.0 tag、Release 与下载链接
+- [x] `CHANGELOG.md` 记录 v0.6.0 的实现与实际验证结果；README 明确 main/Tag 下载方式、EXE SHA256 和未执行验收
+- [x] 父需求按用户确认的小数协议和接收正文修订；已验证 EXE 纳入 main 与 v0.6.0 标签，保留历史标签，不依赖功能分支或 Release 交付
 
 ## 交付状态
 
@@ -38,7 +38,7 @@ AFK
 - PyInstaller 6.22.0 干净构建及打包程序冒烟通过，清单包含 QtCharts；本地产物 `dist/req0005/PaimonAssistant.exe`。
 - 已完成独立只读审查、滚动锚点与悬停查询修正、队列分配失败原子性修正及图表主题修正；README、CHANGELOG 已回填最终结果。
 - 未执行真实 com0com 联调（5 项默认跳过）、100% 缩放人工复验、高帧率长时间设备压力测试；另有 1 项符号链接权限跳过。
-- 验收后按用户授权推送 `feature/req-0005-integration` 及根目录 v0.6.0 EXE；源码与验证产物已迁回主工作区，12 个 REQ-0005 临时 worktree 已清理，原交接改动已备份。本次未创建 v0.6.0 tag/Release，`main` 与历史 v0.5.0 发布保留。
+- main 与 v0.6.0 标签均包含根目录 EXE；本地/远端临时分支和已完成 worktree 按新交付规则清理，旧 worktree 未提交改动已备份到 `.git/main-only-v0.6.0-backup/`；本次不创建 GitHub Release，下载通过 README 的 main/Tag 固定链接提供。
 
 ## Blocked by
 

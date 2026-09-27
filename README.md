@@ -4,8 +4,8 @@
 
 版本状态：
 
-- 当前分支的源码与 EXE：`v0.6.0` 开发构建，包含独立“波形”页
-- 最新正式 GitHub Release：`v0.5.0`；`v0.6.0` 尚未创建 Release
+- 当前版本：`v0.6.0`，源码与 EXE 已同步到 `main` 和同名版本标签
+- Branches 只保留 `main`；历史版本见 [Tags](https://github.com/moumouku/zhufei_helper/tags)
 
 完整操作步骤见 [docs/user-manual.md](docs/user-manual.md)。
 按功能独立管理的需求文档见 [docs/requirements/index.md](docs/requirements/index.md)。
@@ -21,11 +21,12 @@
 PaimonAssistant.exe
 ```
 
-- **直接下载 v0.6.0 EXE**：[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/heads/feature/req-0005-integration/PaimonAssistant.exe)
-- 当前分支文件页：<https://github.com/moumouku/zhufei_helper/blob/feature/req-0005-integration/PaimonAssistant.exe>
-- 历史正式版本 `v0.5.0`：<https://github.com/moumouku/zhufei_helper/releases/tag/v0.5.0>
+- **直接下载最新版 EXE（main）**：[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/heads/main/PaimonAssistant.exe)
+- **固定版本 v0.6.0 EXE（Tag）**：[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/tags/v0.6.0/PaimonAssistant.exe)
+- 版本源码及文件：[v0.6.0](https://github.com/moumouku/zhufei_helper/tree/v0.6.0)
+- 全部版本：[Tags](https://github.com/moumouku/zhufei_helper/tags)
 
-当前分支根目录的 `PaimonAssistant.exe` 为已验证的 `v0.6.0` 开发构建，支持小数波形和原始载荷正文。下载后即可运行；文件大小为 49,218,386 字节。`main` 和最新正式 Release 仍为 `v0.5.0`，需要波形功能时请使用上面的 v0.6.0 下载链接。
+`main` 与 `v0.6.0` 标签的根目录都包含已验证的 `PaimonAssistant.exe`，支持小数波形和原始载荷正文。下载后即可运行，文件大小为 49,218,386 字节。以后 main 链接随新版本更新，v0.6.0 标签链接固定保留本版本。
 
 当前文件 SHA256：
 
@@ -69,11 +70,11 @@ Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
 - HEX 输入支持空格、逗号混合分隔，非法输入会提示
 - 接收线程与界面线程分离，队列批量刷新界面
 - 串口打开、读写、断开异常会提示并恢复到可重新打开的状态
-- `v0.6.0` 源码开发版本新增“数据/波形”双页面与独立示波器：严格 `\r\n` 分帧的 1～8 通道有符号十进制数值协议，兼容整数并支持小数、单调时钟相对时间 `T+`、最近 180 秒无损原始采样、动态通道与断线缺口、X/Y 缩放平移与真实点悬停、线性化清空/新建采集和资源故障停页保数据；波形接收正文只显示原始载荷，详见下方“波形页”一节
+- `v0.6.0` 新增“数据/波形”双页面与独立示波器：严格 `\r\n` 分帧的 1～8 通道有符号十进制数值协议，兼容整数并支持小数、单调时钟相对时间 `T+`、最近 180 秒无损原始采样、动态通道与断线缺口、X/Y 缩放平移与真实点悬停、线性化清空/新建采集和资源故障停页保数据；波形接收正文只显示原始载荷，详见下方“波形页”一节
 
-## 波形页（v0.6.0 源码开发版本）
+## 波形页（v0.6.0）
 
-“波形”页已包含在本分支根目录的 `v0.6.0` EXE 和源码中。它使用自己的严格 `\r\n` 分帧器和十进制数值协议解析器，与数据页互斥地共用同一个物理串口。
+“波形”页已包含在 `main` 和 `v0.6.0` 标签的 EXE 与源码中。它使用自己的严格 `\r\n` 分帧器和十进制数值协议解析器，与数据页互斥地共用同一个物理串口。
 
 - **页面与接收互斥**：启动默认进入“数据”页。同一时刻最多只有一页接收；开始接收后页面切换被锁定，必须停止接收（关闭物理串口）后才能切页。切页后另一页保持停止，需手动开始；两页的接收历史、分帧器、解析状态和清空操作完全独立，互不回放历史。
 - **十进制数值协议**：严格以连续 `0D 0A` 作为唯一帧结束边界。完整载荷必须是 1～8 个 ASCII 有符号十进制数值，语法为 `[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(,[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)){0,7}`，取值范围为 `-2147483648..2147483647`；兼容整数、正负号和前导零，也接受 `0.96`、`.5`、`1.`。不接受空格、TAB、空字段、尾逗号、指数、`NaN`、`Inf`、HEX 或超过 8 个字段。合法帧产生采样；完整非法帧仍显示原始载荷，但在正文外标记“解析失败”，不产生点、不改变通道数。所有完整帧都按既有 RX 格式写日志，未完成帧和超过 1 MiB 后丢弃的帧不写日志。

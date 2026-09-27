@@ -1,14 +1,15 @@
-# 当前交接：REQ-0005 主工作区与 EXE 交付
+# 当前交接：v0.6.0 已交付 main 与 Tags
 
 ## 目标与位置
 
-用户授权的 REQ-0005 与 issues 012～020 已完成开发、集成和本地交付验证，源码版本为 `0.6.0` 开发构建（尚无正式 Release）。用户验收后已授权同步主工作区、清理本次临时文件、推送集成分支，并明确要求同时推送可直接下载的 EXE。
+REQ-0005 与 issues 012～020 已完成开发、集成和验证。用户明确指定最终交付规则：Branches 只保留 `main`，v0.6.0 进入 Tags 并同步 main，两处均提供可直接下载的 EXE；以后都按此流程交付。
 
-- 工作分支：`feature/req-0005-integration`；推送目标：`origin/feature/req-0005-integration`。
+- 工作分支与推送目标：`main` / `origin/main`。
+- 版本标签：`v0.6.0`，与本次 main 发布提交一致。GitHub Release 本次不另行创建。
 - 工作目录：`E:/projects_learning/zhufei_helps`。
-- 已验收基线：`898f958`，包含小数协议提交 `70ff35d`、原始载荷正文提交 `c18ac6c` 和组合回归测试；主工作区已从 `c333afe` 快进到该基线，后续仅更新交接、下载文档并纳入已验证的 EXE，源码与测试未再修改。
+- 已验收源码基线：`898f958`；`97d1731` 纳入已验证的 EXE。main 已快进包含全部成果，本次仅补齐发布规则、标签和文档，生产源码与测试不变。
 - 原未提交 handoff 已保存在 Git stash（说明为 `Preserve pre-sync REQ-0005 handoff before workspace update`），原始文件、补丁和校验记录另存于 `.git/req0005-preserved/pre-sync-c333afe-898f958/`。该旧文件记录的是实施前状态，不应直接覆盖当前交接。未跟踪的 `NUL` 仍原样保留。
-- 本次 12 个 REQ-0005 临时 worktree 已移除；各本地分支及提交仍保留，共用 `.venv` 未删除。实现子 agent 使用 `coder` 和 `deepseek/deepseek-flash`。
+- 12 个 REQ-0005 临时 worktree 已移除；4 个旧 REQ-0002 worktree 的未提交源码、本机配置及补丁已逐文件备份校验到 `.git/main-only-v0.6.0-backup/`，所有清理前分支和标签保存在其中的 `branches.bundle`。确认 main/Tag 交付成功后清理开发分支及旧 worktree，本地与远端只保留 main；共用 `.venv`、备份与 stash 保留。
 
 ## 已交付
 
@@ -43,8 +44,8 @@
 
 ## 下一步与边界
 
-1. 后续开发在主工作目录 `E:/projects_learning/zhufei_helps` 的 `feature/req-0005-integration` 继续；需要独立目录时可从保留的本地分支重新创建 worktree。
-2. 本次交付向 `origin/feature/req-0005-integration` 推送源码及根目录 v0.6.0 EXE；`main`、历史版本 tag 和 GitHub Release 保持 v0.5.0。v0.6.0 正式发布按另行授权的发布流程执行。
+1. 后续开发在主工作目录 `E:/projects_learning/zhufei_helps` 的 `main` 继续；临时开发分支只用于实施，交付后清理。
+2. 发布执行 `.pi/prompts/update-paimon.md` 与 `docs/ai-update-guide.md`：源码和 EXE 进入 main，创建同一发布提交上的注释标签 `vX.Y.Z`，核验 main 和标签链接实际下载的 EXE，再清理分支/worktree。不能只推功能分支或只传源码压缩包。
 3. 如需真实设备验收，按用户手册 7.8 与 com0com 显式启用步骤操作。
 4. 高采样率时原始数据全量保留，绘图仍需扫描保留数据；没有对设备持续吞吐作性能承诺。后续性能工作不得通过删除窗口内原始点解决。
 
@@ -55,7 +56,7 @@
 - 活动清空使清空前已开始的在途 read 整块失效，下一代读取继续。跨边界单次 read 中可能含清空后到达的字节，这些字节也被丢弃。只有结束符的协议不能识别设备端帧起点；不添加帧头/序号或虚构恢复保证。
 - 波形采样按最新合法采样时间淘汰，完整帧数据区按最新完整帧时间淘汰；停止期间不按墙上时间删除历史。
 - 资源失败保留已提交内存数据并关闭接收，必须显式清空/新建采集后重试；清空会丢弃这些内存数据但不删除持久日志。
-- 仅清理本次 REQ-0005 临时目录；旧任务 worktree、本地分支、用户备份和 `NUL` 保留。推送使用普通快进规则，不改写远端历史。
+- 仅删除已经集成或已验证归档的临时工作；用户备份、stash、共用环境和 `NUL` 保留。main 使用普通快进推送，所有历史标签不移动。
 
 ## 文档健康
 

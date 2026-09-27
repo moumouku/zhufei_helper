@@ -4,7 +4,7 @@
 
 派蒙助手是一款 Windows 串口调试上位机，适用于嵌入式设备、开发板和串口模块的收发调试。
 
-“数据”页只负责原始字节的收发和显示，不解析设备协议；接收数据可以按文本或 HEX 显示，发送数据也可以选择文本或 HEX。源码与当前分支的 v0.6.0 开发构建新增独立的“波形”页，按十进制数值协议解析并绘制波形；下载见 2.1。
+“数据”页只负责原始字节的收发和显示，不解析设备协议；接收数据可以按文本或 HEX 显示，发送数据也可以选择文本或 HEX。v0.6.0 的源码与 EXE 新增独立的“波形”页，按十进制数值协议解析并绘制波形；下载见 2.1。
 
 ## 2. 启动软件
 
@@ -12,11 +12,13 @@
 
 直接下载含波形页的 v0.6.0 单文件程序：
 
-[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/heads/feature/req-0005-integration/PaimonAssistant.exe)
+[v0.6.0 标签固定版本 EXE](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/tags/v0.6.0/PaimonAssistant.exe)
+
+[main 最新版 EXE](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/heads/main/PaimonAssistant.exe)
 
 下载 `PaimonAssistant.exe` 后双击运行即可。打包版本不需要目标电脑安装 Python，也不需要安装任何依赖。
 
-当前分支根目录的 EXE 与源码均为 v0.6.0 开发构建，已包含“波形”页。最新正式 [GitHub Release](https://github.com/moumouku/zhufei_helper/releases/tag/v0.5.0) 仍为 v0.5.0，不包含波形页。
+当前版本为 v0.6.0，`main` 与 `v0.6.0` 标签均包含源码和根目录 EXE。历史版本从 [Tags](https://github.com/moumouku/zhufei_helper/tags) 获取；Branches 只保留 main。
 
 v0.6.0 下载文件的 SHA256 为：
 
@@ -52,7 +54,7 @@ E:\projects_learning\zhufei_helps\PaimonAssistant.exe
 
 ## 3. 主界面
 
-当前源码开发版本的主界面顶部提供“数据”和“波形”两个页面标签，启动默认进入“数据”页，两页初始都不接收。两页共用连接栏的端口、波特率、串口参数和“收发文本编码”，也共用发送区；但同一时刻只有一页可以接收串口数据，活动接收期间不能切换页面（详见第 7 节）。
+当前版本的主界面顶部提供“数据”和“波形”两个页面标签，启动默认进入“数据”页，两页初始都不接收。两页共用连接栏的端口、波特率、串口参数和“收发文本编码”，也共用发送区；但同一时刻只有一页可以接收串口数据，活动接收期间不能切换页面（详见第 7 节）。
 
 “数据”页按四个操作区域组织：
 
@@ -268,7 +270,7 @@ HEX 模式适合检查协议帧、控制字节、零字节和非文本数据。
 
 ## 7. 波形页（示波器）
 
-“波形”页已包含在本分支的 v0.6.0 EXE 和源码中，用于接收并绘制以 `\r\n` 结束的十进制数值波形协议。
+“波形”页已包含在 `main` 和 `v0.6.0` 标签的 EXE 与源码中，用于接收并绘制以 `\r\n` 结束的十进制数值波形协议。
 
 ### 7.1 页面、接收互斥与切换
 
