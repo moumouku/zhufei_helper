@@ -10,8 +10,10 @@ only receive consumer.
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
-from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -25,10 +27,23 @@ from PySide6.QtWidgets import (
 )
 
 from .oscilloscope import (
+    INT32_MAX,
+    INT32_MIN,
     OscilloscopeConnectionBoundary,
     OscilloscopeSession,
     format_connection_boundary_line,
     format_frame_line,
+)
+from .oscilloscope_chart import (
+    DEFAULT_X_MAX,
+    DEFAULT_X_MIN,
+    DEFAULT_Y_MAX,
+    DEFAULT_Y_MIN,
+    build_chart_segments,
+    clamp_x_range,
+    fit_x_range,
+    fit_y_range,
+    keep_x_span_in_range,
 )
 from .theme import CHANNEL_COLORS, COLORS, SIZES, data_font
 
@@ -39,8 +54,9 @@ class OscilloscopePage(QWidget):
     start_requested = Signal()
     stop_requested = Signal()
     clear_requested = Signal()
+    resource_failed = Signal(str)
 
-    def __init__(self, session: OscilloscopeSession, parent=None) -> None:
+    def __init__(self, session: OscilloscopeSession, parent=None, *, chart_builder=None) -> None:
         super().__init__(parent)
         self.setObjectName("oscilloscope_page")
         self.session = session
@@ -48,14 +64,22 @@ class OscilloscopePage(QWidget):
         self._rendering_history = False
         #: 页面已送入数据区的模型记录数；用于检测模型是否淘汰了旧记录。
         self._records_rendered = 0
-        #: 页面已送入绘图 series 的模型采样点数；用于检测模型是否淘汰了旧点。
-        self._samples_rendered = 0
         #: “跟随最新”默认开启；用户上翻后暂停，只有点击“回到最新”才恢复。
         self._follow_latest = True
+        #: 图表是否跟随最新数据；手动缩放/平移后关闭，与数据区跟随互相独立。
+        self._chart_following = True
+        #: 绘图资源失败后保持原始历史但不再重试绘制；由主窗口负责关闭串口。
+        self._resource_failed = False
+        #: 可注入的绘图函数，测试资源失败路径时不依赖真实内存耗尽。
+        self._chart_builder = (
+            chart_builder if chart_builder is not None else build_chart_segments
+        )
         self._user_scroll_pending = False
         self._scroll_settle_generation = 0
         self._scroll_anchor_value = None
+        self._chart_rerender_pending = False
         self._build_ui()
+        self.chart_view.installEventFilter(self)
         self._connect_signals()
 
     # ------------------------------------------------------------- public
@@ -95,16 +119,94 @@ class OscilloscopePage(QWidget):
         self._sync_display([record])
 
     def consume_events(self, events) -> None:
-        """完整帧 → 数据区记录；合法帧另产生采样、图表点和通道最新值。
+        """完整帧 → 数据区记录；合法帧另产生采样、绘图点和通道最新值。
 
         数据区文本以模型保留记录为准：模型只追加时增量显示；一旦按 180 秒
         窗口淘汰旧记录，就从模型重渲，显示区不会继续积累窗口外文本。
+        波形每次都由视口驱动从模型重新生成，绘图 series 不是原始存储。
         """
         new_records = [self.session.consume(event) for event in events]
         new_legal = [record for record in new_records if record.values is not None]
         self._sync_display(new_records)
-        self._sync_chart(new_legal)
-        self._fit_axes()
+        for record in new_legal:
+            for index, value in enumerate(record.values):
+                self._ensure_channel_row(index)
+                self._update_channel_value(f"CH{index + 1}", value)
+        self._sync_view_for_data()
+        self._render_chart_guarded()
+
+    # ------------------------------------------------------- view access
+
+    @property
+    def chart_following(self) -> bool:
+        """图表是否实时跟随最新数据；手动缩放/平移后为 ``False``。"""
+        return self._chart_following
+
+    def x_view_range(self) -> tuple[float, float]:
+        return (self.axis_x.min(), self.axis_x.max())
+
+    def y_view_range(self) -> tuple[float, float]:
+        return (self.axis_y.min(), self.axis_y.max())
+
+    def auto_scale(self) -> None:
+        """一次性把 X 适配保留采样范围，并只按可见 X 内开启通道计算 Y。"""
+        x_min, x_max = fit_x_range(self.session.samples)
+        enabled_segments = [
+            self.session.channel_segments(index)
+            for index in range(self.session.channel_count)
+            if self._channel_enabled(index)
+        ]
+        self.axis_x.setRange(x_min, x_max)
+        self.axis_y.setRange(*fit_y_range(enabled_segments, x_min, x_max))
+        self._set_history_hint(False)
+        self._render_chart_guarded()
+
+    def return_to_latest(self) -> None:
+        """把 X 视口移回最新保留数据并恢复实时跟随；不隐式缩放 Y。"""
+        self._chart_following = True
+        samples = self.session.samples
+        if samples:
+            self.axis_x.setRange(*fit_x_range(samples))
+        self._set_history_hint(False)
+        self._render_chart_guarded()
+
+    def set_view_range(self, x_min, x_max, y_min=None, y_max=None) -> None:
+        """手动设置视口（供缩放/平移使用）；合法范围外的请求被忽略。
+
+        X 被夹紧到仍保留的采样窗口，Y 被夹紧到 int32 硬范围；只要成功
+        应用就退出实时跟随，后续新数据不会把视口强制移回。
+        """
+        try:
+            requested_x = (float(x_min), float(x_max))
+        except (TypeError, ValueError):
+            return
+        if not all(math.isfinite(value) for value in requested_x):
+            return
+        if requested_x[1] <= requested_x[0]:
+            return
+        if (y_min is None) != (y_max is None):
+            return
+        samples = self.session.samples
+        retained = fit_x_range(samples) if samples else (DEFAULT_X_MIN, DEFAULT_X_MAX)
+        new_x = clamp_x_range(requested_x[0], requested_x[1], *retained)
+        if new_x[1] <= new_x[0]:
+            return
+        if y_min is not None:
+            try:
+                requested_y = (float(y_min), float(y_max))
+            except (TypeError, ValueError):
+                return
+            if not all(math.isfinite(value) for value in requested_y):
+                return
+            y_low = max(INT32_MIN, requested_y[0])
+            y_high = min(INT32_MAX, requested_y[1])
+            if y_high <= y_low:
+                return
+            self.axis_y.setRange(y_low, y_high)
+        self.axis_x.setRange(*new_x)
+        self._chart_following = False
+        self._set_history_hint(False)
+        self._render_chart_guarded()
 
     def _sync_display(self, new_records) -> None:
         """模型只追加时保留现有文本和阅读位置；发生淘汰时从模型重渲。"""
@@ -118,21 +220,52 @@ class OscilloscopePage(QWidget):
             self._scroll_to_end()
             self._begin_scroll_settle()
 
-    def _sync_chart(self, new_legal) -> None:
-        """模型只追加时按增量续点；一旦模型淘汰了旧采样就从模型重建。"""
-        if self._samples_rendered + len(new_legal) != self.session.sample_count:
-            self._rebuild_chart_series()
+    def _sync_view_for_data(self) -> None:
+        """新数据后的 X 视口：跟随则适配保留范围，手动则夹紧不越界。"""
+        samples = self.session.samples
+        if not samples:
+            return
+        retained = fit_x_range(samples)
+        if self._chart_following:
+            self.axis_x.setRange(*retained)
+            self._set_history_hint(False)
+            return
+        current = self.x_view_range()
+        shifted = keep_x_span_in_range(current[0], current[1], *retained)
+        if shifted != current:
+            self.axis_x.setRange(*shifted)
+            self._set_history_hint(True)
         else:
-            for record in new_legal:
-                self._append_sample(record.relative_seconds, record.values)
-        self._samples_rendered = self.session.sample_count
+            self._set_history_hint(False)
 
-    def _rebuild_chart_series(self) -> None:
-        """用模型保留的缺口分段点重建全部 series，使图表与模型一致。
+    def _render_chart_guarded(self) -> None:
+        """绘图失败不丢原始历史：停页并上抛信号，由主窗口关闭连接。"""
+        if self._resource_failed:
+            return
+        try:
+            self._render_chart()
+        except Exception as error:  # Qt/内存资源失败必须停页保数据
+            self._on_resource_failed(error)
 
-        通道最新值和通道栏行从模型恢复；通道开关状态保留，只看模型实际
-        保留的点，不保留任何已被 180 秒窗口淘汰的绘制点。
+    def _on_resource_failed(self, error: BaseException) -> None:
+        self._resource_failed = True
+        self._receiving = False
+        self.start_button.setText("开始接收")
+        self.state_label.setText("已停止：绘图资源不足")
+        self.show_diagnostic(
+            f"绘图资源不足，已停止波形接收；已采集的原始数据仍保留（{error}）"
+        )
+        self.resource_failed.emit(str(error))
+
+    def _render_chart(self) -> None:
+        """按当前可见 X、图表像素宽度及通道开关从原始采样重生成 series。
+
+        模型保留的记录数/采样数只增或按窗口淘汰，绘图不持有唯一原始数据；
+        每个通道的每个缺口分段独立成段，隐藏通道的 series 不显示但仍保留
+        开关身份，重新勾选后从原始历史恢复。
         """
+        x_min, x_max = self.x_view_range()
+        pixel_width = self._chart_pixel_width()
         for series_list in self.channel_series.values():
             for series in series_list:
                 self.chart.removeSeries(series)
@@ -144,19 +277,37 @@ class OscilloscopePage(QWidget):
             latest = self.session.channel_latest_value(index)
             if latest is not None:
                 self._update_channel_value(f"CH{index + 1}", latest)
+            rendered = self._chart_builder(
+                self.session.channel_segments(index), x_min, x_max, pixel_width
+            )
             first_series = None
-            for points in self.session.channel_segments(index):
+            for points in rendered or [[]]:
                 series = self._add_channel_segment(index)
                 if first_series is None:
                     first_series = series
                 for relative_seconds, value in points:
                     series.append(float(relative_seconds), float(value))
-            if first_series is None:
-                first_series = self._add_channel_segment(index)
+            for series in self.channel_series[index][1:]:
+                # 缺口分段只是同一通道的曲线延续，图例只保留一个身份条目。
+                for marker in self.chart.legend().markers(series):
+                    marker.setVisible(False)
             if index == 0:
                 self.ch1_series = first_series
         if self.ch1_series is None:
             self.ch1_series = self._add_channel_segment(0)
+
+    def _chart_pixel_width(self) -> int:
+        """当前绘图区像素宽度；布局未完成时退回控件宽度，保证不为零。"""
+        area = self.chart.plotArea()
+        width = area.width() if area.width() > 0 else self.chart_view.width()
+        return max(1, int(width))
+
+    def _channel_enabled(self, index: int) -> bool:
+        check = self.channel_checks.get(f"CH{index + 1}")
+        return check is None or check.isChecked()
+
+    def _set_history_hint(self, visible: bool) -> None:
+        self.history_hint_label.setVisible(bool(visible))
 
     def _render_history(self) -> None:
         """从模型当前保留的记录重渲数据区（记录淘汰或清空后调用）。
@@ -190,16 +341,17 @@ class OscilloscopePage(QWidget):
         was_receiving = self._receiving
         self.session.reset()
         self._records_rendered = 0
-        self._samples_rendered = 0
         if was_receiving:
             # 活动接收清空立即以清空时刻重设 T+0；后续完整帧按新原点计时。
             self.session.begin_acquisition()
         self.display_edit.clear()
         self._reset_channels()
-        self.axis_x.setRange(0.0, 1.0)
-        self.axis_y.setRange(-1.0, 1.0)
+        self.axis_x.setRange(DEFAULT_X_MIN, DEFAULT_X_MAX)
+        self.axis_y.setRange(DEFAULT_Y_MIN, DEFAULT_Y_MAX)
         self.show_diagnostic("")
         self._set_follow_latest(True)
+        self._chart_following = True
+        self._set_history_hint(False)
         self._scroll_anchor_value = None
 
     # ---------------------------------------------------------------- UI
@@ -219,11 +371,17 @@ class OscilloscopePage(QWidget):
         self.follow_button.setObjectName("oscilloscope_follow_button")
         self.follow_button.setCheckable(True)
         self.follow_button.setChecked(True)
+        self.auto_scale_button = QPushButton("自动缩放")
+        self.auto_scale_button.setObjectName("oscilloscope_auto_scale_button")
+        self.chart_latest_button = QPushButton("回到最新")
+        self.chart_latest_button.setObjectName("oscilloscope_chart_latest_button")
         self.state_label = QLabel("未开始")
         self.state_label.setObjectName("oscilloscope_state_label")
         toolbar.addWidget(self.start_button)
         toolbar.addWidget(self.clear_button)
         toolbar.addWidget(self.follow_button)
+        toolbar.addWidget(self.auto_scale_button)
+        toolbar.addWidget(self.chart_latest_button)
         toolbar.addWidget(self.state_label)
         toolbar.addStretch(1)
         root.addLayout(toolbar)
@@ -243,6 +401,14 @@ class OscilloscopePage(QWidget):
         self.log_error_label.setWordWrap(True)
         self.log_error_label.setVisible(False)
         root.addWidget(self.log_error_label)
+
+        #: 历史淘汰越过当前 X 视口时的非模态状态（REQ-0005 §8.8）。
+        self.history_hint_label = QLabel("历史正在滚动淘汰")
+        self.history_hint_label.setObjectName("oscilloscope_history_hint_label")
+        self.history_hint_label.setStyleSheet(f"color: {COLORS['warning']};")
+        self.history_hint_label.setTextFormat(Qt.PlainText)
+        self.history_hint_label.setVisible(False)
+        root.addWidget(self.history_hint_label)
 
         content = QHBoxLayout()
         content.setSpacing(SIZES["spacing"])
@@ -313,6 +479,8 @@ class OscilloscopePage(QWidget):
         self.start_button.clicked.connect(self._on_start_clicked)
         self.clear_button.clicked.connect(self.clear_requested.emit)
         self.follow_button.clicked.connect(self._on_follow_clicked)
+        self.auto_scale_button.clicked.connect(self.auto_scale)
+        self.chart_latest_button.clicked.connect(self.return_to_latest)
         scrollbar = self.display_edit.verticalScrollBar()
         scrollbar.actionTriggered.connect(self._on_display_scroll_action)
         scrollbar.valueChanged.connect(self._on_display_scroll_changed)
@@ -407,13 +575,6 @@ class OscilloscopePage(QWidget):
 
     # ------------------------------------------------------------ channels
 
-    def _append_sample(self, relative_seconds: float, values: tuple[int, ...]) -> None:
-        for index, value in enumerate(values):
-            name = f"CH{index + 1}"
-            self._ensure_channel_row(index)
-            self._update_channel_value(name, value)
-            self._append_channel_point(index, relative_seconds, value)
-
     def _add_channel_segment(self, index: int) -> QLineSeries:
         """为一个通道追加一段真实的 QLineSeries，并接管其坐标轴。"""
         series = QLineSeries()
@@ -428,13 +589,6 @@ class OscilloscopePage(QWidget):
         series.attachAxis(self.axis_y)
         self.channel_series.setdefault(index, []).append(series)
         return series
-
-    def _append_channel_point(self, index: int, relative_seconds: float, value: int) -> None:
-        """按模型的分段数决定续接当前分段还是开始新分段（缺口断线）。"""
-        segments = self.channel_series.setdefault(index, [])
-        if len(segments) < self.session.channel_segment_count(index):
-            self._add_channel_segment(index)
-        segments[-1].append(float(relative_seconds), float(value))
 
     def _ensure_channel_row(self, index: int) -> None:
         """发现新通道时建立通道栏行：默认勾选的开关 + 名称/最新值标签。"""
@@ -464,19 +618,6 @@ class OscilloscopePage(QWidget):
         self.channel_checks[name] = check
         self.channel_labels[name] = label
 
-    def _fit_axes(self) -> None:
-        """最小可见范围：保证已采集点落在视口内且常值数据仍可见。"""
-        samples = self.session.samples
-        if not samples:
-            return
-        x_max = max(sample.relative_seconds for sample in samples)
-        values = [value for sample in samples for value in sample.values]
-        y_min, y_max = min(values), max(values)
-        if y_min == y_max:
-            y_min, y_max = y_min - 1, y_max + 1
-        self.axis_x.setRange(0.0, max(x_max * 1.05, 1e-3))
-        self.axis_y.setRange(y_min, y_max)
-
     def _update_channel_value(self, name: str, value: int) -> None:
         self.channel_labels[name].setText(f"{name}  {value}")
 
@@ -484,3 +625,20 @@ class OscilloscopePage(QWidget):
         """开关只控制绘制：采样、最新值和缺口分段照常维护。"""
         for series in self.channel_series.get(index, []):
             series.setVisible(visible)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt override)
+        """图表尺寸变化后按新的像素宽度从原始采样重新生成绘图输入。"""
+        if watched is self.chart_view and event.type() == QEvent.Type.Resize:
+            # plotArea 在 Resize 事件之后才更新，延后到本轮事件循环末尾重绘。
+            self._schedule_chart_rerender()
+        return super().eventFilter(watched, event)
+
+    def _schedule_chart_rerender(self) -> None:
+        if self._chart_rerender_pending:
+            return
+        self._chart_rerender_pending = True
+        QTimer.singleShot(0, self._finish_chart_rerender)
+
+    def _finish_chart_rerender(self) -> None:
+        self._chart_rerender_pending = False
+        self._render_chart_guarded()
