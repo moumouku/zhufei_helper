@@ -17,7 +17,9 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
+
+from .config import SerialSettings
 
 INT32_MIN = -2_147_483_648
 INT32_MAX = 2_147_483_647
@@ -81,13 +83,26 @@ class OscilloscopeSample:
     values: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class OscilloscopeConnectionBoundary:
+    """A connection-parameter boundary inserted into the waveform data area.
+
+    Written when receiving resumes after a stop and the port or any serial
+    parameter differs from the previous active connection (REQ-0005 §11.3).
+    History, channels and the acquisition origin are preserved.
+    """
+
+    relative_seconds: float
+    settings: SerialSettings
+
+
 class OscilloscopeSession:
     """Acquisition origin plus the waveform page's frame and sample history."""
 
     def __init__(self, monotonic_ns: Optional[Callable[[], int]] = None) -> None:
         self._monotonic_ns = monotonic_ns if monotonic_ns is not None else time.monotonic_ns
         self._origin_ns: Optional[int] = None
-        self._records: List[OscilloscopeFrameRecord] = []
+        self._records: List[Union[OscilloscopeFrameRecord, OscilloscopeConnectionBoundary]] = []
         self._samples: List[OscilloscopeSample] = []
 
     @property
@@ -95,21 +110,53 @@ class OscilloscopeSession:
         return self._origin_ns
 
     @property
-    def records(self) -> List[OscilloscopeFrameRecord]:
+    def records(self) -> List[Union[OscilloscopeFrameRecord, OscilloscopeConnectionBoundary]]:
         return list(self._records)
 
     @property
     def samples(self) -> List[OscilloscopeSample]:
         return list(self._samples)
 
-    def begin_acquisition(self) -> None:
+    def begin_acquisition(self, origin_ns: Optional[int] = None) -> None:
         """Capture ``T+0`` on the first successful start of the session.
 
-        Later starts continue the same acquisition, so the origin is only set
-        once (REQ-0005 §6.2.1, §14.6).
+        ``origin_ns`` is captured at the successful open boundary, before the
+        reader can publish a frame, so the first frame's relative time cannot
+        go negative (issue 014). Later starts continue the same acquisition,
+        so the origin is only set once (REQ-0005 §6.2.1, §14.6).
         """
         if self._origin_ns is None:
-            self._origin_ns = self._monotonic_ns()
+            self._origin_ns = self._monotonic_ns() if origin_ns is None else origin_ns
+
+    def reset(self) -> None:
+        """新建采集的最小重置：清空历史并释放时间原点。
+
+        并发/线性化的清空语义由 issue 019 完整交付；本方法只保证页面清空
+        不再调用不存在的接口，且不再保留旧采集的记录、采样或原点。
+        """
+        self._origin_ns = None
+        self._records.clear()
+        self._samples.clear()
+
+    def note_connection_boundary(
+        self, settings: SerialSettings, at_ns: Optional[int] = None
+    ) -> OscilloscopeConnectionBoundary:
+        """Append one connection boundary at the current relative time.
+
+        ``at_ns`` is the successful-open boundary candidate; the origin is
+        preserved across stop/resume, so the boundary time includes the whole
+        stopped interval (REQ-0005 §6.2.3, §11.3).
+        """
+        if self._origin_ns is None:
+            raise RuntimeError("oscilloscope acquisition has not started")
+        if at_ns is None:
+            at_ns = self._monotonic_ns()
+        record = OscilloscopeConnectionBoundary(
+            relative_seconds=(at_ns - self._origin_ns) / 1_000_000_000,
+            settings=settings,
+        )
+        self._records.append(record)
+        return record
 
     def consume(self, event) -> OscilloscopeFrameRecord:
         """Turn one complete frame into a record, sampling it when legal."""
@@ -146,6 +193,16 @@ def format_payload(payload: bytes) -> str:
         chr(byte) if 0x20 <= byte <= 0x7E else f"\\x{byte:02X}" for byte in payload
     )
     return f'"{text}"'
+
+
+def format_connection_boundary_line(record: OscilloscopeConnectionBoundary) -> str:
+    """One data-area boundary line: relative time plus every serial setting."""
+    settings = record.settings
+    serial_format = f"{settings.data_bits}{settings.parity}{settings.stop_bits:g}"
+    return (
+        f"{format_relative_seconds(record.relative_seconds)}  "
+        f"── 连接边界 {settings.port} · {settings.baudrate} · {serial_format}"
+    )
 
 
 def format_frame_line(record: OscilloscopeFrameRecord) -> str:

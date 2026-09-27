@@ -3,9 +3,12 @@
 The controller owns one serial connection at a time. Every successful open
 creates a fresh receive session (a ``ReceiveFramer`` plus its queues); the
 reader thread only publishes ``ReceivedEvent`` objects into that session's
-queue. ``reset_receive_session()`` swaps the session's framing state under the
-session lock, which is the single linearization point between pre-clear and
-post-clear data. (REQ-0003 §5.1, §10.1)
+queue. Before each reader starts, the driver's pending input buffer is
+cleared so bytes sent while stopped can never be replayed; a cleanup failure
+closes the port and raises ``SerialConnectionError``. ``reset_receive_session()``
+swaps the session's framing state under the session lock, which is the single
+linearization point between pre-clear and post-clear data. (REQ-0003 §5.1, §10.1;
+REQ-0005 §4.3.4)
 """
 
 from __future__ import annotations
@@ -196,6 +199,21 @@ class SerialController:
             raise SerialConnectionError(
                 f"serial factory returned no port for {settings.port!r}"
             )
+
+        # Clear the driver's pending input before the new reader can start:
+        # bytes sent while stopped must never be replayed after a resume.
+        reset_input = getattr(ser, "reset_input_buffer", None)
+        if callable(reset_input):
+            try:
+                reset_input()
+            except Exception as exc:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                raise SerialConnectionError(
+                    f"could not clear serial input buffer for {settings.port!r}: {exc}"
+                ) from exc
 
         # The reader keeps a direct reference to its session (framer + queues)
         # and publishes only while that session's generation is current, so

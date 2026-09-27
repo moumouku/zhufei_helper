@@ -84,7 +84,11 @@ class MainWindow(QMainWindow):
         self._monotonic_ns = (
             monotonic_ns if monotonic_ns is not None else time.monotonic_ns
         )
-        self.controller = controller if controller is not None else SerialController()
+        self.controller = (
+            controller
+            if controller is not None
+            else SerialController(monotonic_ns=self._monotonic_ns)
+        )
         self._log_service = (
             log_service if log_service is not None else ReceiveLogService()
         )
@@ -107,6 +111,8 @@ class MainWindow(QMainWindow):
         self._is_open = False
         self._receive_owner: str | None = None
         self._active_settings: SerialSettings | None = None
+        # 波形页上一次活动连接的设置：恢复时用于判定是否插入连接边界。
+        self._waveform_last_settings: SerialSettings | None = None
         self._event_history: list[ReceivedEvent] = []
         self._raw_history = ReceiveBuffer()
         self._follow_latest = True
@@ -547,20 +553,30 @@ class MainWindow(QMainWindow):
 
     def _close_connection(self) -> None:
         waveform_receiving = self._receive_owner == "waveform"
+        had_connection = self._is_open or self._receive_owner is not None
         self._monitor.clear_connected()
         try:
             self.controller.close()
         except Exception:
             pass
-        if waveform_receiving:
-            # 串口已关闭，但旧连接的待处理帧可能仍在队列中；替换队列
-            # 丢弃它们，停止后再 drain 不得补收（REQ-0005 §4.3.3）。
+        if had_connection:
+            # 会话边界（REQ-0005 §4.3.3）：停止后替换队列，丢弃旧连接待处理
+            # 事件、未完成帧和旧 reader 延迟返回的数据，任一页面都不补收。
             try:
                 self.controller.reset_receive_session()
             except Exception:
                 pass
+        if waveform_receiving:
+            # 恢复数据页的解析模式选择；波形连接期间的强制分帧不影响页面状态。
+            try:
+                self.controller.set_raw_mode(self._data_parse_is_raw())
+            except Exception:
+                pass
             self.oscilloscope_page.end_acquisition()
         self._set_open_state(False)
+
+    def _data_parse_is_raw(self) -> bool:
+        return self.parse_mode_combo.currentText() == RAW_MODE
 
     # --------------------------------------------------------- enumeration
 
@@ -646,7 +662,20 @@ class MainWindow(QMainWindow):
             stop_bits=float(self.stop_bits_combo.currentText()),
         )
 
+    @staticmethod
+    def _same_settings(first: SerialSettings, second: SerialSettings) -> bool:
+        """同一物理连接参数（SerialSettings 本身不定义值相等）。"""
+        return (
+            first.port == second.port
+            and first.baudrate == second.baudrate
+            and first.data_bits == second.data_bits
+            and first.parity == second.parity
+            and first.stop_bits == second.stop_bits
+        )
+
     def _on_open_clicked(self) -> None:
+        if self.page_tabs.currentWidget() is self.oscilloscope_page:
+            return  # 数据页打开操作只在数据页生效
         if self._receive_owner == "waveform":
             return  # 波形页接收中：数据页不能接管或关闭物理连接
         if self._is_open:
@@ -666,17 +695,32 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------- waveform page
 
     def _on_waveform_start_clicked(self) -> None:
+        if self.page_tabs.currentWidget() is not self.oscilloscope_page:
+            return  # 波形页开始操作只在波形页生效
         if self._is_open:
             return
         try:
             settings = self._build_settings()
+            # 原点候选在成功打开边界之前采样：首帧边界不会早于原点（issue 014）。
+            origin_ns = self._monotonic_ns()
+            connection_changed = (
+                self._waveform_last_settings is not None
+                and not self._same_settings(self._waveform_last_settings, settings)
+            )
+            # 波形页始终使用严格 `\r\n` 分帧，不受数据页原始字节模式影响
+            # （REQ-0005 §2.3.5）；停止后恢复数据页模式选择。
+            self.controller.set_raw_mode(False)
             self.controller.open(settings)
         except Exception as exc:
+            self.controller.set_raw_mode(self._data_parse_is_raw())
             self._set_open_state(False)
             QMessageBox.critical(self, "打开失败", str(exc))
             return
         self._active_settings = settings
-        self.oscilloscope_page.begin_acquisition()
+        self._waveform_last_settings = settings
+        self.oscilloscope_page.begin_acquisition(origin_ns)
+        if connection_changed:
+            self.oscilloscope_page.show_connection_boundary(settings, origin_ns)
         self._set_open_state(True, owner="waveform")
         self._monitor.set_connected(settings.port)
 
@@ -686,13 +730,17 @@ class MainWindow(QMainWindow):
         self._close_connection()
 
     def _on_waveform_clear_clicked(self) -> None:
-        if self._receive_owner == "waveform":
-            # 清空是会话内线性化点：先丢弃尚未处理的队列数据（REQ-0005 §9.2）。
+        if self.page_tabs.currentWidget() is not self.oscilloscope_page:
+            return  # 波形清空只在波形页生效，不得越页清除历史
+        receiving = self._receive_owner == "waveform"
+        # 先清页面并重设 T+0，再以控制器会话边界丢弃旧队列：清空是新原点的
+        # 起点，清空后发布的新帧相对时间不会为负（并发线性化归 issue 019）。
+        self.oscilloscope_page.clear_acquisition()
+        if receiving:
             try:
                 self.controller.reset_receive_session()
             except Exception:
                 pass
-        self.oscilloscope_page.clear_acquisition()
 
     # ------------------------------------------------------------- receive
 
@@ -880,9 +928,11 @@ class MainWindow(QMainWindow):
         """切换接收解析模式：通知控制器、同步时间戳控件、按新模式重渲（§3.3）。
 
         已积累的两种历史都不清空；切换只影响后续数据如何进入链路。
+        波形页持有接收所有权时不得改动当前会话的模式（REQ-0005 §4.2）。
         """
-        raw_mode = self.parse_mode_combo.currentText() == RAW_MODE
-        self.controller.set_raw_mode(raw_mode)
+        if self._receive_owner != "waveform":
+            raw_mode = self.parse_mode_combo.currentText() == RAW_MODE
+            self.controller.set_raw_mode(raw_mode)
         self._update_receive_mode_ui()
         self._update_status()
         self._render_history()

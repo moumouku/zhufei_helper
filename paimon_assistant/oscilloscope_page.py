@@ -23,7 +23,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .oscilloscope import OscilloscopeSession, format_frame_line
+from .oscilloscope import (
+    OscilloscopeSession,
+    format_connection_boundary_line,
+    format_frame_line,
+)
 from .theme import COLORS, SIZES, data_font
 
 
@@ -48,9 +52,13 @@ class OscilloscopePage(QWidget):
     def is_receiving(self) -> bool:
         return self._receiving
 
-    def begin_acquisition(self) -> None:
-        """First successful start establishes ``T+0``; later starts keep it."""
-        self.session.begin_acquisition()
+    def begin_acquisition(self, origin_ns=None) -> None:
+        """First successful start establishes ``T+0``; later starts keep it.
+
+        ``origin_ns`` is captured before the connection opens, so the first
+        framed boundary can never precede the origin (issue 014).
+        """
+        self.session.begin_acquisition(origin_ns)
         self._receiving = True
         self.start_button.setText("停止接收")
         self.state_label.setText("接收中")
@@ -69,6 +77,11 @@ class OscilloscopePage(QWidget):
         self.log_error_label.setText(text or "")
         self.log_error_label.setVisible(bool(text))
 
+    def show_connection_boundary(self, settings, at_ns=None) -> None:
+        """恢复接收且参数变化时，在数据区插入连接边界记录（REQ-0005 §11.3）。"""
+        record = self.session.note_connection_boundary(settings, at_ns)
+        self.display_edit.appendPlainText(format_connection_boundary_line(record))
+
     def consume_events(self, events) -> None:
         """完整帧 → 数据区记录；合法帧另产生采样、图表点和通道最新值。"""
         for event in events:
@@ -80,7 +93,11 @@ class OscilloscopePage(QWidget):
 
     def clear_acquisition(self) -> None:
         """清空波形/新建采集：重置时间原点、历史、图表和通道栏。"""
+        was_receiving = self._receiving
         self.session.reset()
+        if was_receiving:
+            # 活动接收清空立即以清空时刻重设 T+0；后续完整帧按新原点计时。
+            self.session.begin_acquisition()
         self.display_edit.clear()
         self.ch1_series.clear()
         for label in self.channel_labels.values():

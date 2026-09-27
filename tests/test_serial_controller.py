@@ -934,3 +934,61 @@ class TestRawMode:
         assert controller.raw_queue.empty()
         assert old_queue.empty()
         controller.close()
+
+
+# ---------------------------------------------------------------------------
+# REQ-0005 issue 014: connection boundary input-buffer cleanup
+# ---------------------------------------------------------------------------
+
+class RecordingResetFakeSerial(FakeSerial):
+    """FakeSerial that records the driver input-buffer cleanup call."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.events = []
+
+    def reset_input_buffer(self):
+        self.events.append("reset")
+
+    def read(self, n=1):
+        self.events.append("read")
+        return super().read(n)
+
+
+class FailingResetFakeSerial(FakeSerial):
+    """FakeSerial whose driver input-buffer cleanup fails."""
+
+    def reset_input_buffer(self):
+        raise OSError("input buffer unavailable")
+
+
+def test_open_resets_driver_input_buffer_before_first_read(factory, port_lister):
+    factory.fake_cls = RecordingResetFakeSerial
+    controller = SerialController(serial_factory=factory, port_lister=port_lister)
+    try:
+        controller.open(make_settings())
+        ser = factory.instances[0]
+
+        assert wait_until(lambda: "read" in ser.events), "reader never read"
+        assert ser.events[0] == "reset", (
+            "driver input buffer must be cleared before the first read"
+        )
+    finally:
+        controller.close()
+
+
+def test_open_failure_to_clear_input_buffer_closes_port_and_stays_closed(
+    factory, port_lister
+):
+    factory.fake_cls = FailingResetFakeSerial
+    controller = SerialController(serial_factory=factory, port_lister=port_lister)
+
+    with pytest.raises(SerialConnectionError) as excinfo:
+        controller.open(make_settings())
+
+    assert "input buffer unavailable" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, OSError)
+    assert factory.instances[0].closed
+    assert not controller.is_open
+    with pytest.raises(SerialConnectionError):
+        controller.write(b"x")
