@@ -737,7 +737,7 @@ class OscilloscopePage(QWidget):
         self.display_edit.setObjectName("oscilloscope_display_edit")
         self.display_edit.setFont(data_font())
         self.display_edit.setReadOnly(True)
-        self.display_edit.setPlaceholderText("等待完整帧，对端需以 \\r\\n 结束的整数载荷")
+        self.display_edit.setPlaceholderText("等待完整帧，对端需以 \\r\\n 结束的十进制数值载荷")
         content.addWidget(self.display_edit, 1)
 
         self.chart = QChart()

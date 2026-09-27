@@ -369,3 +369,111 @@ def test_incomplete_frame_is_not_displayed_sampled_or_logged_before_boundary(
 
     page.start_button.click()
     window.close()
+
+
+# ------------- 小数协议修订端到端回归：正文/采样/绘图/RX 日志/数据页隔离
+
+
+def test_decimal_frames_end_to_end_keep_raw_body_samples_chart_and_rx_hex_log(
+    qtbot, mw, tmp_path
+):
+    """0.96/328.00 与 -0.13/330.00 多帧经真实链路保持原始正文与小数。"""
+    clock = StepClock()
+    controller, factory = _make_real_controller(clock)
+    log_service = ReceiveLogService(tmp_path / "logs")
+    window = _make_window(qtbot, mw, controller, tmp_path, clock, log_service)
+    page = window.oscilloscope_page
+    window.page_tabs.setCurrentIndex(1)
+    page.start_button.click()
+    serial = factory.instances[0]
+
+    # 第一帧 CRLF 跨两个读取块：`\r` 与 `\n` 分别到达；随后一个读取块
+    # 再带出两条完整帧，验证读取块内多帧的顺序与各自边界时间。
+    clock.monotonic_ns = 1_250_000_000
+    clock.wall_ms = 1_700_000_000_250
+    serial.feed(b"0.96,328.00\r")
+    clock.monotonic_ns = 1_500_000_000
+    clock.wall_ms = 1_700_000_000_500
+    serial.feed(b"\n")
+    assert wait_until(lambda: controller.received_queue.qsize() == 1)
+
+    clock.monotonic_ns = 1_750_000_000
+    clock.wall_ms = 1_700_000_000_750
+    serial.feed(b"-0.13,330.00\r\n0.76,329.00\r\n")
+    assert wait_until(lambda: controller.received_queue.qsize() == 3)
+    window._drain_queues()
+
+    payloads = [b"0.96,328.00", b"-0.13,330.00", b"0.76,329.00"]
+    raw_frames = [payload + b"\r\n" for payload in payloads]
+    # 边界时间属于识别出 CRLF 的那个读取块；拆分帧不得用载荷块的时间。
+    boundary_ms = [1_700_000_000_500, 1_700_000_000_750, 1_700_000_000_750]
+
+    records = page.session.records
+    assert [record.payload for record in records] == payloads
+    assert [record.raw_frame for record in records] == raw_frames
+    assert [record.values for record in records] == [
+        (0.96, 328.0),
+        (-0.13, 330.0),
+        (0.76, 329.0),
+    ]
+    assert all(record.parse_ok for record in records)
+
+    assert page.session.samples == [
+        OscilloscopeSample(0.5, (0.96, 328.0)),
+        OscilloscopeSample(0.75, (-0.13, 330.0)),
+        OscilloscopeSample(0.75, (0.76, 329.0)),
+    ], "会话采样保留小数且相对时间取 CRLF 边界块"
+    assert page.session.channel_latest_value(0) == 0.76
+    assert page.session.channel_latest_value(1) == 329.0
+
+    # 接收正文只显示完整帧的原始载荷文本，不夹带旧格式标记或解析状态。
+    text = page.display_edit.toPlainText()
+    assert text == "0.96,328.00\n-0.13,330.00\n0.76,329.00"
+    assert "payload=" not in text
+    assert '"' not in text
+    assert "T+" not in text
+    assert "解析" not in text
+    assert page.protocol_status_label.text() == ""
+    assert not page.protocol_status_label.isVisibleTo(page)
+
+    # CH1/CH2 的真实 QtCharts 系列收到未截断的小数原始点。
+    ch1_points = page.channel_series[0][0]
+    assert ch1_points.count() == 3
+    assert [ch1_points.at(index).x() for index in range(3)] == [
+        pytest.approx(0.5),
+        pytest.approx(0.75),
+        pytest.approx(0.75),
+    ]
+    assert [ch1_points.at(index).y() for index in range(3)] == [
+        pytest.approx(0.96),
+        pytest.approx(-0.13),
+        pytest.approx(0.76),
+    ]
+    ch2_points = page.channel_series[1][0]
+    assert ch2_points.count() == 3
+    assert [ch2_points.at(index).x() for index in range(3)] == [
+        pytest.approx(0.5),
+        pytest.approx(0.75),
+        pytest.approx(0.75),
+    ]
+    assert [ch2_points.at(index).y() for index in range(3)] == [
+        pytest.approx(328.0),
+        pytest.approx(330.0),
+        pytest.approx(329.0),
+    ]
+
+    # RX HEX 日志逐条保留完整原始帧（含 0D 0A），拆分帧只写一行。
+    log_path = log_service.log_dir / (
+        datetime.fromtimestamp(boundary_ms[0] // 1000).date().isoformat() + ".txt"
+    )
+    assert log_path.read_text(encoding="utf-8").splitlines() == [
+        rx_line(ms, raw) for ms, raw in zip(boundary_ms, raw_frames)
+    ]
+
+    # 波形接收不得把帧或原始字节泄漏到数据页历史。
+    assert window.display_edit.toPlainText() == ""
+    assert window._raw_history.raw() == b""
+    assert window._event_history == []
+
+    page.start_button.click()
+    window.close()

@@ -25,7 +25,7 @@ AFK
 - [x] 在 Python 3.10 + PySide6 6.6.x 最低支持环境验证 QtCharts 导入、核心图表测试和源码冒烟；同时在 Python 3.11 开发环境通过全量测试，不新增 PySide6 之外的图表运行时依赖
 - [x] PyInstaller 干净构建包含 QtCharts，源码和打包程序的 `--smoke-test` 均通过
 - [x] 必要的 Windows 原生 QtCharts 鼠标交互验收步骤明确记录；真实 com0com 验收保持显式启用且不成为普通自动测试前提
-- [x] `README.md` 与 `docs/user-manual.md` 准确说明数据/波形页、接收互斥、整数协议、时间语义、三分钟窗口和图表操作
+- [x] `README.md` 与 `docs/user-manual.md` 准确说明数据/波形页、接收互斥、十进制数值协议、时间语义、三分钟窗口和图表操作
 - [x] `CHANGELOG.md` 增加未发布的 v0.6.0 实现与实际验证结果，程序版本信息同步为 `0.6.0`；README 明确源码开发版本 v0.6.0 与最新已发布 EXE v0.5.0，未执行的测试或手工验收不得宣称通过
 - [x] 不修改父 PRD 的已确认决定，不替换仓库根 `PaimonAssistant.exe` 或其 SHA，不修改 v0.5.0 发布链接，不创建 Release、不执行发布 commit/tag/push
 
@@ -33,8 +33,8 @@ AFK
 
 本 issue 的功能、文档、源码版本与本地交付验证已完成：
 
-- Python 3.11.15 + PySide6 6.11.1、Python 3.10.19 + PySide6 6.6.3.1 两套环境均通过全量回归 `568 passed, 6 skipped`；QtCharts 导入及源码冒烟通过。
-- Windows 原生专项 `73 passed`；125% 缩放下检查 1080 × 680、760 × 480 的数据页与八通道波形页。
+- Python 3.11.15 + PySide6 6.11.1、Python 3.10.19 + PySide6 6.6.3.1 两套环境均通过全量回归 `620 passed, 6 skipped`；QtCharts 导入及源码冒烟通过。
+- Windows 原生 QtCharts 交互专项（本轮小数协议修订后）`22 passed`；前次更广原生专项基线为 `73 passed`；前次 125% 缩放下检查 1080 × 680、760 × 480 的数据页与八通道波形页。
 - PyInstaller 6.22.0 干净构建及打包程序冒烟通过，清单包含 QtCharts；本地产物 `dist/req0005/PaimonAssistant.exe`。
 - 已完成独立只读审查、滚动锚点与悬停查询修正、队列分配失败原子性修正及图表主题修正；README、CHANGELOG 已回填最终结果。
 - 未执行真实 com0com 联调（5 项默认跳过）、100% 缩放人工复验、高帧率长时间设备压力测试；另有 1 项符号链接权限跳过。
@@ -50,7 +50,7 @@ AFK
 
 - US-1：在“数据”和“波形”页面间切换
 - US-2：两页独立开始/停止接收并隔离历史
-- US-3：严格解析 1～8 个整数通道
+- US-3：严格解析 1～8 个十进制数值通道，兼容整数并支持小数
 - US-4：查看帧、相对时间、波形和通道状态
 - US-5：保留并交互检查最近 180 秒原始数据
 - US-6：将完整示波器帧写入既有 RX 日志
