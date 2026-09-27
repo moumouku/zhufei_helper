@@ -699,6 +699,7 @@ class OscilloscopePage(QWidget):
         self.channel_labels: dict[str, QLabel] = {}
         self.ch1_series = self._add_channel_segment(0)
         self.chart_view = OscilloscopeChartView(self.chart)
+        self.chart_view.setBackgroundBrush(QColor(COLORS["receive"]))
         self.chart_view.setObjectName("oscilloscope_chart_view")
         self.chart_view.setRenderHint(QPainter.Antialiasing)
         self.chart_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)

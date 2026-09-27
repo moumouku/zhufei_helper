@@ -19,7 +19,7 @@ from PySide6.QtGui import QColor  # noqa: E402
 
 from paimon_assistant.oscilloscope import OscilloscopeSession  # noqa: E402
 from paimon_assistant.oscilloscope_page import OscilloscopePage  # noqa: E402
-from paimon_assistant.theme import CHANNEL_COLORS  # noqa: E402
+from paimon_assistant.theme import CHANNEL_COLORS, COLORS, apply_theme  # noqa: E402
 from test_oscilloscope_lifecycle import BoundaryEvent, StepClock  # noqa: E402
 
 
@@ -40,6 +40,15 @@ def make_page(qtbot) -> tuple[OscilloscopePage, StepClock]:
     qtbot.addWidget(page)
     page.begin_acquisition()
     return page, clock
+
+
+def test_chart_view_margin_uses_graphite_theme(qtbot):
+    page, _clock = make_page(qtbot)
+    apply_theme(page)
+    page.resize(1080, 680)
+    page.show()
+    image = page.chart_view.grab().toImage()
+    assert image.pixelColor(2, 2) == QColor(COLORS["receive"])
 
 
 # ------------------------------------------------ 模型：动态通道数
