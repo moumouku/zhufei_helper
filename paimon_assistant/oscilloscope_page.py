@@ -42,6 +42,7 @@ from .oscilloscope import (
     format_connection_boundary_line,
     format_frame_line,
     format_relative_seconds,
+    format_sample_value,
 )
 from .oscilloscope_chart import (
     DEFAULT_X_MAX,
@@ -1023,8 +1024,8 @@ class OscilloscopePage(QWidget):
         self.channel_checks[name] = check
         self.channel_labels[name] = label
 
-    def _update_channel_value(self, name: str, value: int) -> None:
-        self.channel_labels[name].setText(f"{name}  {value}")
+    def _update_channel_value(self, name: str, value: float) -> None:
+        self.channel_labels[name].setText(f"{name}  {format_sample_value(value)}")
 
     def _set_channel_visible(self, index: int, visible: bool) -> None:
         """开关只控制绘制：采样、最新值和缺口分段照常维护。"""
@@ -1184,7 +1185,8 @@ class OscilloscopePage(QWidget):
     def _format_hover(sample) -> str:
         """``T+... s`` 加该帧实际存在的全部通道和值。"""
         fields = "  ".join(
-            f"CH{index + 1}={value}" for index, value in enumerate(sample.values)
+            f"CH{index + 1}={format_sample_value(value)}"
+            for index, value in enumerate(sample.values)
         )
         return f"{format_relative_seconds(sample.relative_seconds)}  {fields}"
 

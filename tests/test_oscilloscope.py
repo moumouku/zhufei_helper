@@ -82,7 +82,7 @@ def test_valid_single_integer_frame_produces_one_sample_at_boundary_time():
         b"",
         b"1 2",
         b"1\t2",
-        b"1.5",
+        b"1e5",
         b"0x12",
         "１２".encode(),
         b"abc",

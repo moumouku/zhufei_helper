@@ -219,7 +219,7 @@ def test_waveform_end_to_end_protocol_matrix_display_samples_and_log(
         (b"1,", b"1,\r\n"),  # 尾逗号
         (b"1 2", b"1 2\r\n"),  # 空格
         (b"1\t2", b"1\t2\r\n"),  # TAB
-        (b"1.5", b"1.5\r\n"),  # 浮点
+        (b"1e5", b"1e5\r\n"),  # 指数
         ("１２".encode(), "１２".encode() + b"\r\n"),  # 非 ASCII 数字
         (b"abc", b"abc\r\n"),  # 非法字符
         (b"2147483648", b"2147483648\r\n"),  # int32 正溢出

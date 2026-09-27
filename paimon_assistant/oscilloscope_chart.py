@@ -30,8 +30,8 @@ MIN_VISIBLE_X_SPAN = 1.0
 #: 手动缩放允许的最小轴跨度；反复放大后仍须非零、非反向。
 MIN_ZOOM_SPAN = 1e-9
 
-#: ``(relative_seconds, value)``；value 始终是原始 int32，不插值。
-Point = tuple[float, int]
+#: ``(relative_seconds, value)``；value 是模型保留的原始 binary64 采样值，不插值。
+Point = tuple[float, float]
 Segment = list[Point]
 Segments = Sequence[Sequence[Point]]
 

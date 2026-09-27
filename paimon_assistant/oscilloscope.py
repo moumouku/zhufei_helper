@@ -6,10 +6,11 @@ monotonic clock (``event.monotonic_ns``). This module owns the waveform page's
 independent frame history and samples: it turns those complete frames into
 records whose relative time is computed against the acquisition origin.
 
-Issue 013 owns the payload grammar: a payload is valid exactly when it is one
-or more signed decimal int32 values separated by ASCII commas. Anything else
-is a complete but invalid frame: it is still recorded, displayed and logged,
-but it produces no sample.
+Issue 013 owns the payload grammar (extended by the REQ-0005 decimal
+revision): a payload is valid exactly when it is one or more signed decimal
+values between the signed 32-bit bounds, separated by ASCII commas. Anything
+else is a complete but invalid frame: it is still recorded, displayed and
+logged, but it produces no sample.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from array import array
 from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Callable, Deque, Iterable, List, Optional, Union
 
 from .config import SerialSettings
@@ -27,11 +29,15 @@ from .config import SerialSettings
 INT32_MIN = -2_147_483_648
 INT32_MAX = 2_147_483_647
 
-#: 1 to 8 signed decimal fields separated by ASCII commas, digits ``0``-``9`` only.
-_COMMA_SEPARATED_INTEGERS = re.compile(rb"[+-]?[0-9]+(?:,[+-]?[0-9]+){0,7}")
+#: 1 to 8 signed decimal fields separated by ASCII commas: optional sign, ASCII
+#: digits and at most one decimal point (``+.5`` and ``1.`` are legal spellings).
+_DECIMAL_FIELD = rb"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+_COMMA_SEPARATED_DECIMALS = re.compile(
+    _DECIMAL_FIELD + rb"(?:," + _DECIMAL_FIELD + rb"){0,7}"
+)
 
-#: ``|INT32_MIN|`` has 10 significant digits; a longer magnitude overflows.
-_MAX_SIGNIFICANT_DIGITS = 10
+#: ``INT32_MAX`` has 10 integer digits, so an 11-digit integer part overflows.
+_MAX_INTEGER_DIGITS = 10
 
 #: REQ-0005 §5.1: at most 8 comma-separated fields per legal frame.
 _MAX_CHANNELS = 8
@@ -46,11 +52,12 @@ _COMPACT_MIN_PREFIX = 1024
 class CompactSampleStore:
     """原始采样点的紧凑数值存储（REQ-0005 §7.2.5）。
 
-    每条合法采样共享一个相对时间，只保存该帧实际字段的 int32 值：
+    每条合法采样共享一个相对时间，只保存该帧实际字段的十进制值
+    （binary64，能精确表示全部 int32）：
 
     - ``times``：每条采样的共同相对时间（``array('d')``，8 字节/点）；
     - ``widths``：该帧实际字段数 1～8（``array('B')``，1 字节/点）；
-    - ``values``：按帧顺序拉平的实际字段值（``array('i')``，4 字节/值）；
+    - ``values``：按帧顺序拉平的实际字段值（``array('d')``，8 字节/值）；
     - ``offsets``：每条采样在 ``values`` 中的起始下标（``array('I')``，4 字节/点），
       使按时间二分的区间查询无需从头累计前面所有帧的宽度。
 
@@ -66,7 +73,7 @@ class CompactSampleStore:
     def __init__(self) -> None:
         self.times = array("d")
         self.widths = array("B")
-        self.values = array("i")
+        self.values = array("d")
         self.offsets = array("I")
         #: 物理数组中第一条保留采样的下标；``base`` 是它的绝对序号。
         self.start = 0
@@ -90,7 +97,7 @@ class CompactSampleStore:
         """相对第一条保留采样 ``position`` 处的实际字段数。"""
         return self.widths[self.start + position]
 
-    def iter_samples(self) -> Iterable[tuple[float, tuple[int, ...]]]:
+    def iter_samples(self) -> Iterable[tuple[float, tuple[float, ...]]]:
         """按时间顺序产出 ``(相对时间, 该帧实际值元组)``，不保留元组。"""
         start = self.start
         running = self.values_start
@@ -104,7 +111,7 @@ class CompactSampleStore:
 
     def iter_samples_in_range(
         self, x_min: float, x_max: float
-    ) -> Iterable[tuple[float, tuple[int, ...]]]:
+    ) -> Iterable[tuple[float, tuple[float, ...]]]:
         """产出相对时间落在闭区间 ``[x_min, x_max]`` 的保留采样。
 
         时间数组按追加顺序单调；二分定位第一条不早于 ``x_min`` 的采样，
@@ -122,7 +129,7 @@ class CompactSampleStore:
             width = self.widths[position]
             yield self.times[position], tuple(self.values[offset : offset + width])
 
-    def iter_channel_points(self, index: int) -> Iterable[tuple[int, float, int]]:
+    def iter_channel_points(self, index: int) -> Iterable[tuple[int, float, float]]:
         """产出实际提供通道 ``index`` 的 ``(位置, 相对时间, 值)``。
 
         单次扫描平铺值数组，绘图按位置是否连续把缺口切成分段。
@@ -136,7 +143,7 @@ class CompactSampleStore:
                 yield position, self.times[start + position], self.values[running + index]
             running += width
 
-    def append(self, relative_seconds: float, values: tuple[int, ...]) -> None:
+    def append(self, relative_seconds: float, values: tuple[float, ...]) -> None:
         """提交一条采样；任何一步分配失败都回滚本次追加，保留旧数据。"""
         times_len = len(self.times)
         widths_len = len(self.widths)
@@ -188,34 +195,49 @@ class CompactSampleStore:
         self.values_start = 0
         self.base = 0
 
-    def _append_values(self, values: tuple[int, ...]) -> None:
+    def _append_values(self, values: tuple[float, ...]) -> None:
         self.values.extend(values)
 
 
-def parse_frame_payload(payload: bytes) -> Optional[tuple[int, ...]]:
+def parse_frame_payload(payload: bytes) -> Optional[tuple[float, ...]]:
     """Parse one complete frame payload; ``None`` means "解析失败".
 
-    Leading zeros are stripped before ``int()`` so up to 1 MiB of zero padding
-    never trips CPython's integer-string digit limit; a magnitude longer than
-    10 significant digits is rejected as overflow, then the value is checked
-    against the signed 32-bit range.
+    Leading zeros are stripped before ``Decimal`` conversion so up to 1 MiB of
+    zero padding never trips CPython's integer-string digit limit; an integer
+    part longer than 10 significant digits is rejected as overflow. The range
+    check compares the *intended* decimal value against the signed 32-bit
+    bounds (never a float rounding of it), and only then is the value stored
+    as binary64, which represents every accepted int32 exactly.
     """
-    if _COMMA_SEPARATED_INTEGERS.fullmatch(payload) is None:
+    if _COMMA_SEPARATED_DECIMALS.fullmatch(payload) is None:
         return None
     values = []
     for field in payload.split(b","):
-        sign = field[0:1]
-        digits = field[1:] if sign in (b"+", b"-") else field
-        digits = digits.lstrip(b"0")
-        if len(digits) > _MAX_SIGNIFICANT_DIGITS:
-            return None
-        value = int(digits) if digits else 0
-        if sign == b"-":
-            value = -value
-        if not INT32_MIN <= value <= INT32_MAX:
+        value = _parse_decimal_field(field)
+        if value is None:
             return None
         values.append(value)
     return tuple(values)
+
+
+def _parse_decimal_field(field: bytes) -> Optional[float]:
+    """Parse one signed decimal field, or ``None`` when it overflows int32."""
+    sign = field[0:1]
+    digits = field[1:] if sign in (b"+", b"-") else field
+    integer_part, point, fraction_part = digits.partition(b".")
+    integer_part = integer_part.lstrip(b"0")
+    if len(integer_part) > _MAX_INTEGER_DIGITS:
+        return None
+    fraction_part = fraction_part.rstrip(b"0")
+    text = integer_part or b"0"
+    if point and fraction_part:
+        text += b"." + fraction_part
+    value = Decimal(text.decode("ascii"))
+    if sign == b"-":
+        value = -value
+    if not INT32_MIN <= value <= INT32_MAX:
+        return None
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -229,7 +251,7 @@ class OscilloscopeFrameRecord:
     relative_seconds: float
     payload: bytes
     raw_frame: bytes
-    values: Optional[tuple[int, ...]]
+    values: Optional[tuple[float, ...]]
 
     @property
     def parse_ok(self) -> bool:
@@ -241,7 +263,7 @@ class OscilloscopeSample:
     """The raw values of one legal frame at its shared relative time."""
 
     relative_seconds: float
-    values: tuple[int, ...]
+    values: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -273,7 +295,7 @@ class OscilloscopeSession:
         #: 采样存储只保存数值数组；测试可注入失败替身验证追加原子性。
         self._store = CompactSampleStore() if sample_store is None else sample_store
         self._channel_count = 0
-        self._latest_values: List[int] = [0] * _MAX_CHANNELS
+        self._latest_values: List[float] = [0] * _MAX_CHANNELS
         #: 每通道当前保留的缺口语义分段数；逐点 O(1) 更新，淘汰时按
         #: “被淘汰点有值且下一条保留点缺该字段”递减。
         self._segment_counts: List[int] = [0] * _MAX_CHANNELS
@@ -289,7 +311,7 @@ class OscilloscopeSession:
         """当前会话见过的最大合法字段数（0～8，只增不减）。"""
         return self._channel_count
 
-    def channel_latest_value(self, index: int) -> Optional[int]:
+    def channel_latest_value(self, index: int) -> Optional[float]:
         """通道 ``index``（0 起）最新一条实际提供该字段的有效值。
 
         短帧不更新缺失字段；非法帧完全不更新。还没出现过的字段返回 ``None``。
@@ -302,7 +324,7 @@ class OscilloscopeSession:
         """通道 ``index``（0 起）当前的分段数（O(1)）。"""
         return self._segment_counts[index]
 
-    def channel_segments(self, index: int) -> List[List[tuple[float, int]]]:
+    def channel_segments(self, index: int) -> List[List[tuple[float, float]]]:
         """通道 ``index``（0 起）的缺口分段点序列。
 
         同一合法帧的所有字段共享同一时间；缺失字段不生成伪采样，而是在
@@ -313,8 +335,8 @@ class OscilloscopeSession:
             raise IndexError(index)
         if index < 0:
             index += _MAX_CHANNELS
-        segments: List[List[tuple[float, int]]] = []
-        current: Optional[List[tuple[float, int]]] = None
+        segments: List[List[tuple[float, float]]] = []
+        current: Optional[List[tuple[float, float]]] = None
         previous_position = -2
         for position, relative_seconds, value in self._store.iter_channel_points(index):
             if position != previous_position + 1:
@@ -445,7 +467,7 @@ class OscilloscopeSession:
         return record
 
     def _plan_sample_metadata(
-        self, values: tuple[int, ...]
+        self, values: tuple[float, ...]
     ) -> tuple[List[tuple[int, int]], int]:
         """提交前先算出元数据变化，保证分配失败时状态未被触碰。"""
         increments = [
@@ -460,7 +482,7 @@ class OscilloscopeSession:
         return increments, channel_count
 
     def _apply_sample_metadata(
-        self, values: tuple[int, ...], plan: tuple[List[tuple[int, int]], int]
+        self, values: tuple[float, ...], plan: tuple[List[tuple[int, int]], int]
     ) -> None:
         """只做赋值、不再分配；在采样与帧记录都提交成功后调用。"""
         increments, channel_count = plan
@@ -494,6 +516,20 @@ class OscilloscopeSession:
 def format_relative_seconds(seconds: float) -> str:
     """``T+012.345 s``; relative time never claims to be the MCU clock."""
     return f"T+{seconds:07.3f} s"
+
+
+def format_sample_value(value: float) -> str:
+    """Shortest readout text for one stored value; integral values stay integers.
+
+    ``repr`` is the shortest decimal that round-trips binary64, so ``0.96``
+    never displays as ``0.9599999999999999`` and no fixed significant-digit
+    truncation is introduced. Integral values (including ``-0.0``) keep the
+    legacy plain-integer label instead of ``328.0``.
+    """
+    integral = int(value)
+    if value == integral:
+        return str(integral)
+    return repr(value)
 
 
 def format_payload(payload: bytes) -> str:

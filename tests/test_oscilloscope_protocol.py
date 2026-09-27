@@ -2,8 +2,9 @@
 
 只通过 ``paimon_assistant.oscilloscope`` 的公开接口验证行为：
 ``parse_frame_payload`` 严格接受 1～8 个 ASCII 半角逗号分隔的有符号十进制
-int32；合法完整帧经 ``OscilloscopeSession`` 恰好产生一个同时间的采样集合，
-非法完整帧保留载荷但不产生采样。
+值（含小数拼写），每个值必须落于 int32 范围内；合法完整帧经
+``OscilloscopeSession`` 恰好产生一个同时间的采样集合，非法完整帧保留载荷
+但不产生采样。
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ def test_int32_endpoints_are_legal_and_first_out_of_range_values_fail():
         b"1 ",
         b"1 2",
         b"1\t2",
-        b"1.5",
+        b"1e5",
         b"0x12",
         "１２".encode(),
         b"abc",
