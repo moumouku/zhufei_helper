@@ -513,13 +513,21 @@ class OscilloscopePage(QWidget):
             return format_connection_boundary_line(record)
         return format_frame_line(record)
 
-    def clear_acquisition(self) -> None:
-        """清空波形/新建采集：重置时间原点、历史、图表和通道栏。"""
+    def clear_acquisition(self, origin_ns: int | None = None) -> None:
+        """清空波形/新建采集：重置时间原点、历史、图表和通道栏。
+
+        ``origin_ns`` 是控制器会话锁内捕获的新采集原点（issue 019）。提供时
+        直接使用，不再读页面时钟。页面独立使用（无控制器）且正在接收时，
+        退回本页时钟读取一次，保持既有行为。
+        """
         was_receiving = self._receiving
         self.session.reset()
         self._records_rendered = 0
-        if was_receiving:
-            # 活动接收清空立即以清空时刻重设 T+0；后续完整帧按新原点计时。
+        # 显式新建采集才解除绘图资源失败状态；清理资源诊断与旧悬停读值。
+        self._resource_failed = False
+        if origin_ns is not None:
+            self.session.begin_acquisition(origin_ns)
+        elif was_receiving:
             self.session.begin_acquisition()
         self.display_edit.clear()
         self._reset_channels()
@@ -532,6 +540,12 @@ class OscilloscopePage(QWidget):
         self._initial_y_pending = True
         self._set_history_hint(False)
         self._scroll_anchor_value = None
+        # 使清空前排队的滚动/图表落定失效，避免旧锚点重新定位新采集。
+        self._scroll_settle_generation += 1
+        self._user_scroll_pending = False
+        self._dragging = False
+        self._drag_axes = (False, False)
+        self._drag_last_value = None
         self._hide_hover()
 
     # ---------------------------------------------------------------- UI

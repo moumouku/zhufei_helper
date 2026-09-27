@@ -731,7 +731,7 @@ def test_ac17_clear_drops_preclear_tail_and_pending_events(tmp_path, qtbot):
     """
     now = FakeNow(TODAY)
     controller, factory = make_controller(
-        [[b"OLD\r\nAB\r", b"\nC\r\n"]], block=True, clock_ms=now
+        [[b"OLD\r\nAB\r", b"\nC\r\n", b"\nC\r\n"]], block=True, clock_ms=now
     )
     window = make_window(
         qtbot, controller, ReceiveLogService(tmp_path / "logs", now_ms=now)
@@ -759,6 +759,10 @@ def test_ac17_clear_drops_preclear_tail_and_pending_events(tmp_path, qtbot):
         select(window.receive_mode_combo, "HEX")
         window.timestamp_checkbox.setChecked(True)
         assert window.display_edit.toPlainText() == ""
+
+        serial.release()  # 清空时仍在阻塞的读属于清空前：整体丢弃
+        assert wait_until(lambda: serial.parks >= 3), "清空后 reader 未继续读"
+        assert controller.received_queue.empty()
 
         serial.release()  # 旧尾部 `AB\r` 若幸存，会在这里拼成一个 `AB` 事件
         assert wait_until(
@@ -804,7 +808,7 @@ def test_ac17_post_clear_data_forms_new_events_display_and_log(tmp_path, qtbot):
     """§13.17 清空后新到达数据正常成事件/显示/写日志；切换显示不复活旧事件。"""
     now = FakeNow(datetime(2026, 5, 17, 9, 12, 3, 125000))
     controller, factory = make_controller(
-        [[b"old\r\n", b"new\r\n"]], block=True, clock_ms=now
+        [[b"old\r\n", b"new\r\n", b"new\r\n"]], block=True, clock_ms=now
     )
     log_dir = tmp_path / "logs"
     window = make_window(qtbot, controller, ReceiveLogService(log_dir, now_ms=now))
@@ -820,6 +824,10 @@ def test_ac17_post_clear_data_forms_new_events_display_and_log(tmp_path, qtbot):
 
         window.clear_button.click()
         assert window.display_edit.toPlainText() == ""
+
+        serial.release()  # 清空时阻塞的读属于清空前：整体丢弃
+        assert wait_until(lambda: serial.parks >= 3), "清空后 reader 未继续读"
+        assert controller.received_queue.empty()
 
         serial.release()
         assert wait_until(lambda: not controller.received_queue.empty())

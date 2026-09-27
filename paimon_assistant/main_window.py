@@ -706,6 +706,9 @@ class MainWindow(QMainWindow):
             connection_changed = (
                 self._waveform_last_settings is not None
                 and not self._same_settings(self._waveform_last_settings, settings)
+                # 新建的空采集没有旧连接数据可混，不得插入伪连接边界
+                # （REQ-0005 §11.3；清空后由 issue 019 重置判定基准）。
+                and self.oscilloscope_page.session.record_count > 0
             )
             # 波形页始终使用严格 `\r\n` 分帧，不受数据页原始字节模式影响
             # （REQ-0005 §2.3.5）；停止后恢复数据页模式选择。
@@ -733,14 +736,23 @@ class MainWindow(QMainWindow):
         if self.page_tabs.currentWidget() is not self.oscilloscope_page:
             return  # 波形清空只在波形页生效，不得越页清除历史
         receiving = self._receive_owner == "waveform"
-        # 先清页面并重设 T+0，再以控制器会话边界丢弃旧队列：清空是新原点的
-        # 起点，清空后发布的新帧相对时间不会为负（并发线性化归 issue 019）。
-        self.oscilloscope_page.clear_acquisition()
-        if receiving:
+        if self._receive_owner == "data":
+            # 数据页持有连接时不得触碰其会话队列（正常 UI 下接收期间已禁止
+            # 切页，这里只保留防御性隔离）。
+            origin_ns = None
+        else:
+            # 控制器会话锁内的队列/代次/分帧尾部切换是唯一线性化点，并在同一
+            # 锁内捕获新采集原点；页面只使用该原点，不再读第二次时钟。
             try:
-                self.controller.reset_receive_session()
-            except Exception:
-                pass
+                origin_ns = self.controller.reset_receive_session()
+            except Exception as exc:
+                # 线性化点失败：不得先清页面再宣称成功，保留旧历史并报告。
+                self.oscilloscope_page.show_diagnostic(f"清空波形失败：{exc}")
+                return
+        # 新建采集：清空后不会再有旧连接数据，空采集不得因设置变化插连接边界；
+        # 活动接收时后续数据仍来自当前连接，保留它供停止后判定真实连接变化。
+        self._waveform_last_settings = self._active_settings if receiving else None
+        self.oscilloscope_page.clear_acquisition(origin_ns)
 
     # ------------------------------------------------------------- receive
 

@@ -486,6 +486,21 @@ def test_hover_hides_far_on_leave_and_after_view_or_data_changes(qtbot):
     assert not page.hover_label.isVisible(), "新数据到达后不得保留可能过期的读值"
 
 
+def test_clear_hides_hover_readout(qtbot):
+    """清空同时清除悬停读值，不得把旧采集值留在新采集中（REQ-0005 §9.1）。"""
+    page, clock = make_page(qtbot)
+    show_page(qtbot, page)
+    page.consume_events([frame(clock, 250_000_000, b"12")])
+    page.set_view_range(0.0, 1.0, y_min=0.0, y_max=100.0)
+    move_mouse(page, viewport_point_of(page, 0.25, 12.0))
+    assert page.hover_label.isVisible()
+
+    page.clear_acquisition()
+
+    assert not page.hover_label.isVisible(), "清空后旧悬停读值必须失效"
+    assert page.hover_label.text() == ""
+
+
 def test_hover_ignores_disabled_channels_and_hides_when_none_enabled(qtbot):
     page, clock = make_page(qtbot)
     show_page(qtbot, page)

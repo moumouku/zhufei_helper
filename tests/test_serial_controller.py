@@ -341,8 +341,14 @@ def test_write_forwards_bytes_verbatim_and_outside_receive_path(controller, fact
 
 
 def test_reset_receive_session_discards_pending_items_tail_and_keeps_reading():
-    """Reset is the linearization point: old tail/queue items never survive."""
-    factory = GatedFactory([[b"AB\r", b"\n", b"C\r\n"]])
+    """Reset is the linearization point: old tail/queue items never survive.
+
+    Read #2 starts before the reset and carries a complete ``STALE`` frame;
+    the generation captured before that read drops it. Read #3 starts after
+    the reset and still produces ``\nC``, proving the old ``AB\r`` tail was
+    dropped and later reads keep working.
+    """
+    factory = GatedFactory([[b"AB\r", b"STALE\r\n", b"\n", b"C\r\n"]])
     controller = SerialController(
         serial_factory=factory, port_lister=FakePortLister([])
     )
@@ -367,8 +373,12 @@ def test_reset_receive_session_discards_pending_items_tail_and_keeps_reading():
         assert old_diagnostic.empty()
         assert controller.received_queue.empty()
 
+        serial.release()  # 清空前开始的读取：整个 STALE 事件不得越过边界
+        assert wait_until(lambda: serial.read_starts >= 3), "重置后 reader 未继续读"
+        assert controller.received_queue.empty()
+
         serial.release()  # 单独的 `\n`：旧尾部 `AB\r` 若幸存，会在这里成事件
-        assert wait_until(lambda: serial.read_starts >= 3), "重置后首块未被处理"
+        assert wait_until(lambda: serial.read_starts >= 4), "重置后首块未被处理"
         assert controller.received_queue.empty()
 
         serial.release()
@@ -377,6 +387,126 @@ def test_reset_receive_session_discards_pending_items_tail_and_keeps_reading():
         if serial is not None:
             serial.release()
         controller.close()
+
+
+def test_reset_receive_session_waits_for_locked_publish_and_discards_it():
+    """Clear must wait for an in-progress locked publish, then discard it.
+
+    A frame already being fed/enqueued under the session lock belongs to the
+    pre-clear side of the boundary: the reset cannot interleave with it, and
+    its queued event is dropped with the old queue.
+    """
+
+    class PublishGateController(SerialController):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.publish_entered = threading.Event()
+            self.publish_release = threading.Event()
+
+        def _publish_events(self, session, data):
+            self.publish_entered.set()
+            assert self.publish_release.wait(timeout=5.0)
+            super()._publish_events(session, data)
+
+    factory = GatedFactory([[b"OLD\r\n", b"", b"NEW\r\n"]])
+    controller = PublishGateController(
+        serial_factory=factory, port_lister=FakePortLister([])
+    )
+    serial = None
+    resetter = None
+    try:
+        controller.open(make_settings("COM1"))
+        serial = factory.instances[0]
+        assert wait_until(lambda: serial.read_starts >= 1)
+        serial.release()  # 该块的发布将停在锁内的 gate 上
+        assert controller.publish_entered.wait(timeout=2.0)
+
+        reset_done = threading.Event()
+
+        def run_reset():
+            controller.reset_receive_session()
+            reset_done.set()
+
+        resetter = threading.Thread(target=run_reset, daemon=True)
+        resetter.start()
+        assert not reset_done.wait(timeout=0.1), "reset 未等待锁内发布完成"
+
+        controller.publish_release.set()
+        assert reset_done.wait(timeout=2.0), "发布结束后 reset 未完成"
+        resetter.join(timeout=2.0)
+
+        assert controller.received_queue.empty(), "清空前锁内发布的帧被旧队列丢弃"
+
+        serial.release()  # 空块：不论捕获到新旧代次都不会发布
+        assert wait_until(lambda: serial.read_starts >= 3), "重置后 reader 未继续读"
+        serial.release()  # 此读在 reset 完成后才开始：正常发布新帧
+        assert controller.received_queue.get(timeout=2.0).payload == b"NEW"
+    finally:
+        if serial is not None:
+            serial.release()
+        if resetter is not None:
+            resetter.join(timeout=2.0)
+        controller.close()
+
+
+def test_reset_receive_session_rejects_read_that_started_before_reset():
+    """A read parked before the reset must not publish after it (issue 019).
+
+    The generation is captured before the blocking read, so a clear that
+    happens while the reader is parked invalidates that whole read even
+    though the reset keeps the same session object. The reader must then
+    keep processing the next read under the new generation.
+    """
+    factory = GatedFactory([[b"OLD\r\n", b"NEW\r\n"]])
+    controller = SerialController(
+        serial_factory=factory, port_lister=FakePortLister([])
+    )
+    serial = None
+    try:
+        controller.open(make_settings("COM1"))
+        serial = factory.instances[0]
+        assert wait_until(lambda: serial.read_starts >= 1), "reader never parked"
+
+        controller.reset_receive_session()  # 在 read 阻塞期间清空
+        assert controller.received_queue.empty()
+
+        serial.release()  # 该 read 在清空前已开始：整块不得越过边界
+        assert wait_until(lambda: serial.read_starts >= 2), "重置后 reader 未继续读"
+        assert controller.received_queue.empty(), (
+            "清空前开始的读取不得在清空后发布"
+        )
+
+        serial.release()
+        assert controller.received_queue.get(timeout=2.0).payload == b"NEW"
+        assert controller.received_queue.empty()
+    finally:
+        if serial is not None:
+            serial.release()
+        controller.close()
+
+
+def test_reset_receive_session_returns_new_origin_only_while_open():
+    """The waveform clear origin is captured inside the session lock.
+
+    The controller returns it while the connection is open and ``None`` when
+    closed, so a stopped clear never re-anchors until the next successful
+    start (REQ-0005 §9.2/§9.4).
+    """
+    now = [100]
+    controller = SerialController(
+        serial_factory=RecordingFactory(),
+        port_lister=FakePortLister([]),
+        monotonic_ns=lambda: now[0],
+    )
+    assert controller.reset_receive_session() is None
+
+    controller.open(make_settings("COM1"))
+    now[0] = 500
+    assert controller.reset_receive_session() == 500
+
+    controller.close()
+    now[0] = 900
+    assert controller.reset_receive_session() is None
 
 
 def test_reset_receive_session_while_closed_is_safe(controller, factory):
@@ -401,7 +531,7 @@ def test_reset_receive_session_while_closed_is_safe(controller, factory):
 def test_reset_receive_session_clears_overflow_state():
     """After reset the framer reports a fresh overflow instead of staying fused."""
     oversized = b"x" * (1_048_576 + 1)
-    factory = GatedFactory([[oversized, b"y" * 16, oversized, b"\r\n"]])
+    factory = GatedFactory([[oversized, b"y" * 16, oversized, oversized]])
     controller = SerialController(
         serial_factory=factory, port_lister=FakePortLister([])
     )
@@ -420,8 +550,12 @@ def test_reset_receive_session_clears_overflow_state():
             controller.diagnostic_queue.get_nowait()
 
         controller.reset_receive_session()
-        serial.release()  # overflow state was dropped: reports again
+        serial.release()  # read #3 began pre-reset: dropped, not framed
         assert wait_until(lambda: serial.read_starts >= 4, timeout=5.0)
+        with pytest.raises(queue.Empty):
+            controller.diagnostic_queue.get_nowait()
+
+        serial.release()  # overflow state was dropped: a fresh overflow reports again
         assert controller.diagnostic_queue.get(timeout=2.0) == "接收帧超过 1 MiB，已丢弃"
         assert controller.received_queue.empty()
     finally:

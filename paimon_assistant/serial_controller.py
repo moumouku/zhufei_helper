@@ -3,12 +3,14 @@
 The controller owns one serial connection at a time. Every successful open
 creates a fresh receive session (a ``ReceiveFramer`` plus its queues); the
 reader thread only publishes ``ReceivedEvent`` objects into that session's
-queue. Before each reader starts, the driver's pending input buffer is
+queue after checking the generation it captured before the blocking read.
+Before each reader starts, the driver's pending input buffer is
 cleared so bytes sent while stopped can never be replayed; a cleanup failure
 closes the port and raises ``SerialConnectionError``. ``reset_receive_session()``
 swaps the session's framing state under the session lock, which is the single
-linearization point between pre-clear and post-clear data. (REQ-0003 §5.1, §10.1;
-REQ-0005 §4.3.4)
+linearization point between pre-clear and post-clear data, and returns the new
+monotonic acquisition origin captured in that same lock. (REQ-0003 §5.1, §10.1;
+REQ-0005 §4.3.4, §9.2)
 """
 
 from __future__ import annotations
@@ -73,23 +75,21 @@ def _discard_pending(q: queue.Queue) -> None:
 class _ReceiveSession:
     """Framing state shared by the controller and one connection's reader.
 
-    ``generation`` identifies the controller's current receive generation.
-    The reader publishes under the session lock only while the generation is
-    still current, so a delayed reader from a closed connection can never
-    leak into a later session. Resetting the receive session mutates this
-    object in place, which keeps the same open reader publishing through the
-    fresh framer and queues.
+    The reader publishes through this session only while the generation it
+    captured before its blocking ``read()`` is still current, so a delayed
+    read from a closed, replaced or reset connection can never leak into a
+    later receive generation. Resetting the receive session swaps this
+    object's queues and framer in place, which keeps the same open reader
+    publishing through the fresh state after it observes the new generation.
     """
 
-    __slots__ = ("generation", "framer", "received_queue", "diagnostic_queue", "raw_queue")
+    __slots__ = ("framer", "received_queue", "diagnostic_queue", "raw_queue")
 
     def __init__(
         self,
-        generation: int,
         clock_ms: Callable[[], int],
         monotonic_ns: Optional[Callable[[], int]] = None,
     ) -> None:
-        self.generation = generation
         self.received_queue: queue.Queue = queue.Queue()
         self.diagnostic_queue: queue.Queue = queue.Queue()
         self.raw_queue: queue.Queue = queue.Queue()
@@ -216,15 +216,14 @@ class SerialController:
                 ) from exc
 
         # The reader keeps a direct reference to its session (framer + queues)
-        # and publishes only while that session's generation is current, so
-        # data from a closed connection can never reach a later one.
+        # and publishes only reads whose start generation is still current, so
+        # data from a closed, replaced or cleared connection can never reach a
+        # later one.
         error_queue: queue.Queue = queue.Queue()
         stop_event = threading.Event()
         with self._session_lock:
             self._generation += 1
-            session = _ReceiveSession(
-                self._generation, self._clock_ms, self._monotonic_ns
-            )
+            session = _ReceiveSession(self._clock_ms, self._monotonic_ns)
             reader = threading.Thread(
                 target=self._reader_loop,
                 args=(ser, stop_event, session, error_queue),
@@ -376,7 +375,7 @@ class SerialController:
         with self._session_lock:
             return self._raw_mode
 
-    def reset_receive_session(self) -> None:
+    def reset_receive_session(self) -> Optional[int]:
         """Atomically drop the current session's framing state and queued data.
 
         This is the linearization point between "before clear" and "after
@@ -384,8 +383,14 @@ class SerialController:
         framer and replaces both receive queues, discarding every item still
         pending in the old queue objects. Safe while closed: it never touches
         the serial port.
+
+        Returns the new acquisition origin (monotonic ns) captured inside
+        this same lock while the connection is open, or ``None`` when closed.
+        The waveform page uses it to re-anchor without a second clock read;
+        other callers may ignore it (REQ-0005 §9.2).
         """
         with self._session_lock:
+            origin_ns = self._monotonic_ns() if self._is_open else None
             self._generation += 1
             old_received = self.received_queue
             old_diagnostic = self.diagnostic_queue
@@ -395,7 +400,6 @@ class SerialController:
             self.raw_queue = queue.Queue()
             session = self._session
             if session is not None:
-                session.generation = self._generation
                 session.received_queue = self.received_queue
                 session.diagnostic_queue = self.diagnostic_queue
                 session.raw_queue = self.raw_queue
@@ -403,6 +407,7 @@ class SerialController:
             _discard_pending(old_received)
             _discard_pending(old_diagnostic)
             _discard_pending(old_raw)
+            return origin_ns
 
     # -- background reader -------------------------------------------------
 
@@ -419,6 +424,10 @@ class SerialController:
         file I/O and no logging, so the reader never depends on log state.
         """
         while not stop_event.is_set():
+            # Capture the generation before the blocking read: a reset while
+            # the read is parked must invalidate the whole chunk it returns.
+            with self._session_lock:
+                read_generation = self._generation
             try:
                 data = ser.read(self._READ_CHUNK)
             except Exception as exc:
@@ -431,26 +440,35 @@ class SerialController:
             if data:
                 if stop_event.is_set():
                     break
-                self._publish_events(session, data)
+                self._publish_read(session, data, read_generation)
             else:
                 stop_event.wait(self._READ_POLL)
 
-    def _publish_events(self, session: _ReceiveSession, data: bytes) -> None:
-        """Publish one read chunk under the session lock, in the active mode.
+    def _publish_read(
+        self, session: _ReceiveSession, data: bytes, read_generation: int
+    ) -> None:
+        """Publish one read only if its start generation is still current.
 
-        Holding the lock across feed + enqueue makes ``reset_receive_session``
-        a single linearization point, and the generation check drops output
-        from a reader whose connection was closed or replaced mid-read.
-        Raw mode bypasses the framer entirely (REQ-0004 §3.2).
+        The generation check and the enqueue happen under the same lock as
+        ``reset_receive_session``, so a read that began before the clear can
+        never cross the linearization point; the reader then captures the new
+        generation for its next read and keeps processing normally.
         """
         with self._session_lock:
-            if session.generation != self._generation:
+            if read_generation != self._generation:
                 return
-            if self._raw_mode:
-                session.raw_queue.put(data)
-                return
-            for event in session.framer.feed(data):
-                session.received_queue.put(event)
+            self._publish_events(session, data)
+
+    def _publish_events(self, session: _ReceiveSession, data: bytes) -> None:
+        """Publish one read chunk; the caller holds the session lock.
+
+        Raw mode bypasses the framer entirely (REQ-0004 §3.2).
+        """
+        if self._raw_mode:
+            session.raw_queue.put(data)
+            return
+        for event in session.framer.feed(data):
+            session.received_queue.put(event)
 
     def _mark_reader_failed(self, ser: Any, stop_event: threading.Event) -> None:
         """Move the active controller to closed state after a read failure."""

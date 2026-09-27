@@ -364,6 +364,28 @@ def test_clear_restores_empty_default_chart_and_chart_follow(qtbot):
     assert page.session.samples == []
 
 
+def test_clear_after_resource_failure_allows_new_acquisition_to_render(qtbot):
+    """显式新建采集解除绘图资源失败状态；清空诊断并恢复绘制（issue 019）。"""
+    failed = {"once": False}
+
+    def flaky_builder(segments, x_min, x_max, pixel_width):
+        if any(segments) and not failed["once"]:
+            failed["once"] = True
+            raise MemoryError("simulated chart allocation failure")
+        return build_chart_segments(segments, x_min, x_max, pixel_width)
+
+    page, clock = make_page(qtbot, chart_builder=flaky_builder)
+    page.consume_events([frame(clock, 0, b"1,2")])
+    assert not page.is_receiving, "资源失败先停止页面接收"
+    assert "资源" in page.diagnostic_label.text()
+
+    page.clear_acquisition(origin_ns=2_000_000_000)
+
+    assert page.diagnostic_label.text() == "", "清空必须清除资源诊断"
+    page.consume_events([frame(clock, 1_000_000_000, b"7")])
+    assert page.ch1_series.count() == 1, "清空后新一轮采集必须恢复绘制"
+
+
 def test_chart_resource_failure_stops_page_and_preserves_raw_samples(qtbot):
     def failing_builder(segments, x_min, x_max, pixel_width):
         if any(segments):
