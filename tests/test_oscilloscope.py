@@ -2,7 +2,8 @@
 
 本文件只通过 ``paimon_assistant.oscilloscope`` 的公开接口验证行为：
 完整帧在帧边界携带单调时间与墙上时间；相对时间由采集原点计算；
-本切片只有简单单通道整数帧产生采样，其他完整载荷安全地解析失败。
+单通道整数帧产生采样，多通道合法载荷由 issue 013 协议测试覆盖，
+完整非法载荷安全地解析失败。
 """
 
 from __future__ import annotations
@@ -79,7 +80,6 @@ def test_valid_single_integer_frame_produces_one_sample_at_boundary_time():
     "payload",
     [
         b"",
-        b"12,34",
         b"1 2",
         b"1\t2",
         b"1.5",

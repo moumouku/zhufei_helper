@@ -6,9 +6,10 @@ monotonic clock (``event.monotonic_ns``). This module owns the waveform page's
 independent frame history and samples: it turns those complete frames into
 records whose relative time is computed against the acquisition origin.
 
-Issue 013 extends the payload grammar to 1..8 integers and owns the full
-invalid-frame matrix; this slice only accepts a single signed decimal int32 so
-every other complete payload safely becomes a parse failure (no sample).
+Issue 013 owns the payload grammar: a payload is valid exactly when it is one
+or more signed decimal int32 values separated by ASCII commas. Anything else
+is a complete but invalid frame: it is still recorded, displayed and logged,
+but it produces no sample.
 """
 
 from __future__ import annotations
@@ -21,18 +22,37 @@ from typing import Callable, List, Optional
 INT32_MIN = -2_147_483_648
 INT32_MAX = 2_147_483_647
 
-#: issue 012 tracer grammar: one signed decimal integer, ASCII digits only.
-_SINGLE_INTEGER = re.compile(rb"[+-]?[0-9]+")
+#: 1 to 8 signed decimal fields separated by ASCII commas, digits ``0``-``9`` only.
+_COMMA_SEPARATED_INTEGERS = re.compile(rb"[+-]?[0-9]+(?:,[+-]?[0-9]+){0,7}")
+
+#: ``|INT32_MIN|`` has 10 significant digits; a longer magnitude overflows.
+_MAX_SIGNIFICANT_DIGITS = 10
 
 
 def parse_frame_payload(payload: bytes) -> Optional[tuple[int, ...]]:
-    """Parse one complete frame payload; ``None`` means "解析失败"."""
-    if _SINGLE_INTEGER.fullmatch(payload) is None:
+    """Parse one complete frame payload; ``None`` means "解析失败".
+
+    Leading zeros are stripped before ``int()`` so up to 1 MiB of zero padding
+    never trips CPython's integer-string digit limit; a magnitude longer than
+    10 significant digits is rejected as overflow, then the value is checked
+    against the signed 32-bit range.
+    """
+    if _COMMA_SEPARATED_INTEGERS.fullmatch(payload) is None:
         return None
-    value = int(payload)
-    if not INT32_MIN <= value <= INT32_MAX:
-        return None
-    return (value,)
+    values = []
+    for field in payload.split(b","):
+        sign = field[0:1]
+        digits = field[1:] if sign in (b"+", b"-") else field
+        digits = digits.lstrip(b"0")
+        if len(digits) > _MAX_SIGNIFICANT_DIGITS:
+            return None
+        value = int(digits) if digits else 0
+        if sign == b"-":
+            value = -value
+        if not INT32_MIN <= value <= INT32_MAX:
+            return None
+        values.append(value)
+    return tuple(values)
 
 
 @dataclass(frozen=True)
