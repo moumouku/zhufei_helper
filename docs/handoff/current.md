@@ -4,12 +4,12 @@
 
 REQ-0005 与 issues 012～020 已完成开发、集成和验证。用户明确指定最终交付规则：Branches 只保留 `main`，v0.6.0 进入 Tags 并同步 main，两处均提供可直接下载的 EXE；以后都按此流程交付。
 
-- 工作分支与推送目标：`main` / `origin/main`。
-- 版本标签：`v0.6.0`，与本次 main 发布提交一致。GitHub Release 本次不另行创建。
+- 当前发布提交候选：`0c1c8c9`，包含已验收源码、根目录 EXE、下载文档和新的 main/Tags 交付规则。
+- 目标推送：`origin/main` 与注释标签 `origin/v0.6.0`；两者应指向同一发布提交。GitHub Release 本次不另行创建。
 - 工作目录：`E:/projects_learning/zhufei_helps`。
 - 已验收源码基线：`898f958`；`97d1731` 纳入已验证的 EXE。main 已快进包含全部成果，本次仅补齐发布规则、标签和文档，生产源码与测试不变。
 - 原未提交 handoff 已保存在 Git stash（说明为 `Preserve pre-sync REQ-0005 handoff before workspace update`），原始文件、补丁和校验记录另存于 `.git/req0005-preserved/pre-sync-c333afe-898f958/`。该旧文件记录的是实施前状态，不应直接覆盖当前交接。未跟踪的 `NUL` 仍原样保留。
-- 12 个 REQ-0005 临时 worktree 已移除；4 个旧 REQ-0002 worktree 的未提交源码、本机配置及补丁已逐文件备份校验到 `.git/main-only-v0.6.0-backup/`，所有清理前分支和标签保存在其中的 `branches.bundle`。确认 main/Tag 交付成功后清理开发分支及旧 worktree，本地与远端只保留 main；共用 `.venv`、备份与 stash 保留。
+- 12 个 REQ-0005 临时 worktree 已移除；4 个旧 REQ-0002 worktree 的未提交源码、本机配置及补丁已逐文件备份校验到 `.git/main-only-v0.6.0-backup/`，所有清理前分支和标签保存在其中的 `branches.bundle`。本次发布成功后清理开发分支及旧 worktree，本地与远端只保留 main；共用 `.venv`、备份与 stash 保留。
 
 ## 已交付
 
