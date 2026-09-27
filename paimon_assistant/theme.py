@@ -25,6 +25,18 @@ COLORS = {
     "brand": "#D9BF8C",
 }
 
+#: REQ-0005 §7.3.6：CH1～CH8 曲线多色方案；身份同时由通道栏名称/开关表达。
+CHANNEL_COLORS = (
+    COLORS["accent"],  # #82AAFF
+    COLORS["success"],  # #8BD49C
+    COLORS["warning"],  # #EBCB8B
+    COLORS["error"],  # #F28B82
+    "#C792EA",
+    "#4FD6BE",
+    "#FF9E64",
+    "#F78FB3",
+)
+
 FONTS = {
     "ui_family": "Microsoft YaHei UI",
     "data_family": "Consolas",

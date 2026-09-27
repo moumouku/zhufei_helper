@@ -14,6 +14,7 @@ from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -28,7 +29,7 @@ from .oscilloscope import (
     format_connection_boundary_line,
     format_frame_line,
 )
-from .theme import COLORS, SIZES, data_font
+from .theme import CHANNEL_COLORS, COLORS, SIZES, data_font
 
 
 class OscilloscopePage(QWidget):
@@ -88,7 +89,7 @@ class OscilloscopePage(QWidget):
             record = self.session.consume(event)
             self.display_edit.appendPlainText(format_frame_line(record))
             if record.values is not None:
-                self._append_sample(record.relative_seconds, record.values[0])
+                self._append_sample(record.relative_seconds, record.values)
         self._fit_axes()
 
     def clear_acquisition(self) -> None:
@@ -99,11 +100,7 @@ class OscilloscopePage(QWidget):
             # 活动接收清空立即以清空时刻重设 T+0；后续完整帧按新原点计时。
             self.session.begin_acquisition()
         self.display_edit.clear()
-        self.ch1_series.clear()
-        for label in self.channel_labels.values():
-            self.channel_layout.removeWidget(label)
-            label.deleteLater()
-        self.channel_labels.clear()
+        self._reset_channels()
         self.axis_x.setRange(0.0, 1.0)
         self.axis_y.setRange(-1.0, 1.0)
         self.show_diagnostic("")
@@ -158,10 +155,6 @@ class OscilloscopePage(QWidget):
         self.chart.setBackgroundBrush(QColor(COLORS["receive"]))
         self.chart.legend().setVisible(True)
         self.chart.legend().setLabelColor(QColor(COLORS["text"]))
-        self.ch1_series = QLineSeries()
-        self.ch1_series.setName("CH1")
-        self.ch1_series.setPen(QPen(QColor(COLORS["accent"]), 2))
-        self.chart.addSeries(self.ch1_series)
         self.axis_x = QValueAxis()
         self.axis_x.setTitleText("T+ s")
         self.axis_x.setRange(0.0, 1.0)
@@ -174,8 +167,12 @@ class OscilloscopePage(QWidget):
             axis.setGridLineColor(QColor(COLORS["divider"]))
         self.chart.addAxis(self.axis_x, Qt.AlignBottom)
         self.chart.addAxis(self.axis_y, Qt.AlignLeft)
-        self.ch1_series.attachAxis(self.axis_x)
-        self.ch1_series.attachAxis(self.axis_y)
+        #: 通道下标（0 起）→ 缺口分段的 QLineSeries 列表。
+        self.channel_series: dict[int, list[QLineSeries]] = {}
+        self.channel_rows: dict[str, QWidget] = {}
+        self.channel_checks: dict[str, QCheckBox] = {}
+        self.channel_labels: dict[str, QLabel] = {}
+        self.ch1_series = self._add_channel_segment(0)
         self.chart_view = QChartView(self.chart)
         self.chart_view.setObjectName("oscilloscope_chart_view")
         self.chart_view.setRenderHint(QPainter.Antialiasing)
@@ -189,11 +186,26 @@ class OscilloscopePage(QWidget):
         self.channel_layout.setSpacing(SIZES["spacing"])
         channel_title = QLabel("通道")
         self.channel_layout.addWidget(channel_title)
-        self.channel_labels: dict[str, QLabel] = {}
         self.channel_layout.addStretch(1)
-        self.channel_panel.setFixedWidth(140)
+        # 最小宽度保留设计下限；宽度随内容增长，避免裁剪 int32 值（通道名称与值都必须可见）。
+        self.channel_panel.setMinimumWidth(140)
         content.addWidget(self.channel_panel)
         root.addLayout(content, 1)
+
+    def _reset_channels(self) -> None:
+        """清空通道推断、通道栏和绘制分段，重建一个空的 CH1 兼容 series。"""
+        for series_list in self.channel_series.values():
+            for series in series_list:
+                self.chart.removeSeries(series)
+                series.deleteLater()
+        self.channel_series = {}
+        for row in self.channel_rows.values():
+            self.channel_layout.removeWidget(row)
+            row.deleteLater()
+        self.channel_rows.clear()
+        self.channel_checks.clear()
+        self.channel_labels.clear()
+        self.ch1_series = self._add_channel_segment(0)
 
     def _connect_signals(self) -> None:
         self.start_button.clicked.connect(self._on_start_clicked)
@@ -207,9 +219,62 @@ class OscilloscopePage(QWidget):
 
     # ------------------------------------------------------------ channels
 
-    def _append_sample(self, relative_seconds: float, value: int) -> None:
-        self.ch1_series.append(relative_seconds, value)
-        self._update_channel_value("CH1", value)
+    def _append_sample(self, relative_seconds: float, values: tuple[int, ...]) -> None:
+        for index, value in enumerate(values):
+            name = f"CH{index + 1}"
+            self._ensure_channel_row(index)
+            self._update_channel_value(name, value)
+            self._append_channel_point(index, relative_seconds, value)
+
+    def _add_channel_segment(self, index: int) -> QLineSeries:
+        """为一个通道追加一段真实的 QLineSeries，并接管其坐标轴。"""
+        series = QLineSeries()
+        series.setName(f"CH{index + 1}")
+        series.setPen(QPen(QColor(CHANNEL_COLORS[index]), 2))
+        series.setPointsVisible(True)  # 单点分段也必须可见
+        check = self.channel_checks.get(f"CH{index + 1}")
+        if check is not None:
+            series.setVisible(check.isChecked())
+        self.chart.addSeries(series)
+        series.attachAxis(self.axis_x)
+        series.attachAxis(self.axis_y)
+        self.channel_series.setdefault(index, []).append(series)
+        return series
+
+    def _append_channel_point(self, index: int, relative_seconds: float, value: int) -> None:
+        """按模型的分段数决定续接当前分段还是开始新分段（缺口断线）。"""
+        segments = self.channel_series.setdefault(index, [])
+        if len(segments) < self.session.channel_segment_count(index):
+            self._add_channel_segment(index)
+        segments[-1].append(float(relative_seconds), float(value))
+
+    def _ensure_channel_row(self, index: int) -> None:
+        """发现新通道时建立通道栏行：默认勾选的开关 + 名称/最新值标签。"""
+        name = f"CH{index + 1}"
+        if name in self.channel_checks:
+            return
+        row = QWidget()
+        row.setObjectName(f"channel_{name}_row")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(SIZES["spacing"])
+        check = QCheckBox()
+        check.setObjectName(f"channel_{name}_check")
+        check.setAccessibleName(name)
+        check.setChecked(True)
+        label = QLabel("")
+        label.setObjectName(f"channel_{name}_label")
+        label.setTextFormat(Qt.PlainText)
+        check.toggled.connect(
+            lambda visible, channel=index: self._set_channel_visible(channel, visible)
+        )
+        row_layout.addWidget(check)
+        row_layout.addWidget(label)
+        row_layout.addStretch(1)
+        self.channel_layout.insertWidget(self.channel_layout.count() - 1, row)
+        self.channel_rows[name] = row
+        self.channel_checks[name] = check
+        self.channel_labels[name] = label
 
     def _fit_axes(self) -> None:
         """最小可见范围：保证已采集点落在视口内且常值数据仍可见。"""
@@ -225,11 +290,9 @@ class OscilloscopePage(QWidget):
         self.axis_y.setRange(y_min, y_max)
 
     def _update_channel_value(self, name: str, value: int) -> None:
-        label = self.channel_labels.get(name)
-        if label is None:
-            label = QLabel(f"{name}  {value}")
-            label.setObjectName(f"channel_{name}_label")
-            self.channel_layout.insertWidget(self.channel_layout.count() - 1, label)
-            self.channel_labels[name] = label
-            return
-        label.setText(f"{name}  {value}")
+        self.channel_labels[name].setText(f"{name}  {value}")
+
+    def _set_channel_visible(self, index: int, visible: bool) -> None:
+        """开关只控制绘制：采样、最新值和缺口分段照常维护。"""
+        for series in self.channel_series.get(index, []):
+            series.setVisible(visible)

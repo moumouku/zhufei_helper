@@ -30,6 +30,9 @@ _COMMA_SEPARATED_INTEGERS = re.compile(rb"[+-]?[0-9]+(?:,[+-]?[0-9]+){0,7}")
 #: ``|INT32_MIN|`` has 10 significant digits; a longer magnitude overflows.
 _MAX_SIGNIFICANT_DIGITS = 10
 
+#: REQ-0005 §5.1: at most 8 comma-separated fields per legal frame.
+_MAX_CHANNELS = 8
+
 
 def parse_frame_payload(payload: bytes) -> Optional[tuple[int, ...]]:
     """Parse one complete frame payload; ``None`` means "解析失败".
@@ -104,10 +107,52 @@ class OscilloscopeSession:
         self._origin_ns: Optional[int] = None
         self._records: List[Union[OscilloscopeFrameRecord, OscilloscopeConnectionBoundary]] = []
         self._samples: List[OscilloscopeSample] = []
+        self._channel_count = 0
+        self._latest_values: List[int] = []
+        #: 每个通道各分段的起始采样下标；缺口 = 两个相邻有效点之间存在短帧。
+        self._segment_starts: List[List[int]] = [[] for _ in range(_MAX_CHANNELS)]
+        self._last_sample_position: List[Optional[int]] = [None] * _MAX_CHANNELS
 
     @property
     def origin_ns(self) -> Optional[int]:
         return self._origin_ns
+
+    @property
+    def channel_count(self) -> int:
+        """当前会话见过的最大合法字段数（0～8，只增不减）。"""
+        return self._channel_count
+
+    def channel_latest_value(self, index: int) -> Optional[int]:
+        """通道 ``index``（0 起）最新一条实际提供该字段的有效值。
+
+        短帧不更新缺失字段；非法帧完全不更新。还没出现过的字段返回 ``None``。
+        """
+        if 0 <= index < len(self._latest_values):
+            return self._latest_values[index]
+        return None
+
+    def channel_segment_count(self, index: int) -> int:
+        """通道 ``index``（0 起）当前的分段数。"""
+        return len(self._segment_starts[index])
+
+    def channel_segments(self, index: int) -> List[List[tuple[float, int]]]:
+        """通道 ``index``（0 起）的缺口分段点序列。
+
+        同一合法帧的所有字段共享同一时间；缺失字段不生成伪采样，而是在
+        缺口两侧切分为不同分段，便于绘图时真正断线。
+        """
+        starts = self._segment_starts[index]
+        segments: List[List[tuple[float, int]]] = []
+        for position, start in enumerate(starts):
+            end = starts[position + 1] if position + 1 < len(starts) else len(self._samples)
+            segments.append(
+                [
+                    (sample.relative_seconds, sample.values[index])
+                    for sample in self._samples[start:end]
+                    if index < len(sample.values)
+                ]
+            )
+        return segments
 
     @property
     def records(self) -> List[Union[OscilloscopeFrameRecord, OscilloscopeConnectionBoundary]]:
@@ -137,6 +182,10 @@ class OscilloscopeSession:
         self._origin_ns = None
         self._records.clear()
         self._samples.clear()
+        self._channel_count = 0
+        self._latest_values = []
+        self._segment_starts = [[] for _ in range(_MAX_CHANNELS)]
+        self._last_sample_position = [None] * _MAX_CHANNELS
 
     def note_connection_boundary(
         self, settings: SerialSettings, at_ns: Optional[int] = None
@@ -179,6 +228,15 @@ class OscilloscopeSession:
         self._records.append(record)
         if values is not None:
             self._samples.append(OscilloscopeSample(relative_seconds, values))
+            position = len(self._samples) - 1
+            if len(values) > self._channel_count:
+                self._channel_count = len(values)
+                self._latest_values.extend([0] * (self._channel_count - len(self._latest_values)))
+            for index, value in enumerate(values):
+                if self._last_sample_position[index] != position - 1:
+                    self._segment_starts[index].append(position)
+                self._last_sample_position[index] = position
+                self._latest_values[index] = value
         return record
 
 
