@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import re
 import time
+from array import array
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque, List, Optional, Union
+from typing import Callable, Deque, Iterable, List, Optional, Union
 
 from .config import SerialSettings
 
@@ -36,6 +37,125 @@ _MAX_CHANNELS = 8
 
 #: REQ-0005 §7.2/§6.3.4: 原始采样与完整帧记录的滚动窗口长度（秒）。
 RETENTION_SECONDS = 180.0
+
+#: 物理丢弃已淘汰前缀的最小批量；摊还后每条采样拷贝成本为 O(1)。
+_COMPACT_MIN_PREFIX = 1024
+
+
+class CompactSampleStore:
+    """原始采样点的紧凑数值存储（REQ-0005 §7.2.5）。
+
+    每条合法采样共享一个相对时间，只保存该帧实际字段的 int32 值：
+
+    - ``times``：每条采样的共同相对时间（``array('d')``，8 字节/点）；
+    - ``widths``：该帧实际字段数 1～8（``array('B')``，1 字节/点）；
+    - ``values``：按帧顺序拉平的实际字段值（``array('i')``，4 字节/值）。
+
+    缺口由 ``widths`` 与拉平的值直接重建，不再保存每通道逐点元组，也不再
+    保存逐点样本对象。淘汰只推进起始偏移，按摊还批量物理丢弃前缀，因此
+    逐点追加与淘汰都不会重建全部保留数组。
+
+    本类同时是测试注入存储分配失败的窄边界：覆盖 ``_append_values`` 或替换
+    其中一个数值数组，即可在一次采样提交的中途抛出 ``MemoryError``，验证
+    会话不提交失败帧、也不淘汰旧窗口。
+    """
+
+    def __init__(self) -> None:
+        self.times = array("d")
+        self.widths = array("B")
+        self.values = array("i")
+        #: 物理数组中第一条保留采样的下标；``base`` 是它的绝对序号。
+        self.start = 0
+        self.values_start = 0
+        self.base = 0
+
+    @property
+    def count(self) -> int:
+        """保留采样点数；不随数组长度增长，O(1)。"""
+        return len(self.times) - self.start
+
+    @property
+    def oldest_time(self) -> float:
+        return self.times[self.start]
+
+    @property
+    def oldest_width(self) -> int:
+        return self.widths[self.start]
+
+    def width_at(self, position: int) -> int:
+        """相对第一条保留采样 ``position`` 处的实际字段数。"""
+        return self.widths[self.start + position]
+
+    def iter_samples(self) -> Iterable[tuple[float, tuple[int, ...]]]:
+        """按时间顺序产出 ``(相对时间, 该帧实际值元组)``，不保留元组。"""
+        start = self.start
+        running = self.values_start
+        count = self.count
+        for position in range(count):
+            width = self.widths[start + position]
+            yield self.times[start + position], tuple(
+                self.values[running : running + width]
+            )
+            running += width
+
+    def iter_channel_points(self, index: int) -> Iterable[tuple[int, float, int]]:
+        """产出实际提供通道 ``index`` 的 ``(位置, 相对时间, 值)``。
+
+        单次扫描平铺值数组，绘图按位置是否连续把缺口切成分段。
+        """
+        start = self.start
+        running = self.values_start
+        count = self.count
+        for position in range(count):
+            width = self.widths[start + position]
+            if index < width:
+                yield position, self.times[start + position], self.values[running + index]
+            running += width
+
+    def append(self, relative_seconds: float, values: tuple[int, ...]) -> None:
+        """提交一条采样；任何一步分配失败都回滚本次追加，保留旧数据。"""
+        times_len = len(self.times)
+        widths_len = len(self.widths)
+        values_len = len(self.values)
+        try:
+            self.times.append(relative_seconds)
+            self.widths.append(len(values))
+            self._append_values(values)
+        except BaseException:
+            del self.times[times_len:]
+            del self.widths[widths_len:]
+            del self.values[values_len:]
+            raise
+
+    def rollback_last(self) -> None:
+        """撤销最近一次成功 ``append``（用于后续帧记录追加失败时）。"""
+        width = self.widths[-1]
+        del self.times[-1:]
+        del self.widths[-1:]
+        del self.values[len(self.values) - width :]
+
+    def evict_oldest(self) -> None:
+        """淘汰第一条保留采样，必要时摊还物理丢弃已淘汰前缀。"""
+        self.values_start += self.widths[self.start]
+        self.start += 1
+        self.base += 1
+        if self.start >= _COMPACT_MIN_PREFIX and self.start >= self.count:
+            del self.times[: self.start]
+            del self.widths[: self.start]
+            del self.values[: self.values_start]
+            self.start = 0
+            self.values_start = 0
+
+    def clear(self) -> None:
+        del self.times[:]
+        del self.widths[:]
+        del self.values[:]
+        self.start = 0
+        self.values_start = 0
+        self.base = 0
+
+    def _append_values(self, values: tuple[int, ...]) -> None:
+        self.values.extend(values)
 
 
 def parse_frame_payload(payload: bytes) -> Optional[tuple[int, ...]]:
@@ -106,21 +226,23 @@ class OscilloscopeConnectionBoundary:
 class OscilloscopeSession:
     """Acquisition origin plus the waveform page's frame and sample history."""
 
-    def __init__(self, monotonic_ns: Optional[Callable[[], int]] = None) -> None:
+    def __init__(
+        self,
+        monotonic_ns: Optional[Callable[[], int]] = None,
+        sample_store: Optional[CompactSampleStore] = None,
+    ) -> None:
         self._monotonic_ns = monotonic_ns if monotonic_ns is not None else time.monotonic_ns
         self._origin_ns: Optional[int] = None
         self._records: Deque[
             Union[OscilloscopeFrameRecord, OscilloscopeConnectionBoundary]
         ] = deque()
-        self._samples: Deque[OscilloscopeSample] = deque()
+        #: 采样存储只保存数值数组；测试可注入失败替身验证追加原子性。
+        self._store = CompactSampleStore() if sample_store is None else sample_store
         self._channel_count = 0
-        self._latest_values: List[int] = []
-        #: 每通道的缺口分段点；每个分段是 ``[(relative_seconds, value), ...]``。
-        #: 缺口 = 上一条采样缺少该字段，新点必须另起一段，绘图不跨缺口连线。
-        #: 分段点用 deque 保存，旧点从左侧 O(1) 淘汰，长时间采集不退化。
-        self._channel_segments: List[List[Deque[tuple[float, int]]]] = [
-            [] for _ in range(_MAX_CHANNELS)
-        ]
+        self._latest_values: List[int] = [0] * _MAX_CHANNELS
+        #: 每通道当前保留的缺口语义分段数；逐点 O(1) 更新，淘汰时按
+        #: “被淘汰点有值且下一条保留点缺该字段”递减。
+        self._segment_counts: List[int] = [0] * _MAX_CHANNELS
         #: 上一条采样是否实际提供了该通道；短帧与首点之后都必须断线。
         self._last_sample_had_field: List[bool] = [False] * _MAX_CHANNELS
 
@@ -138,13 +260,13 @@ class OscilloscopeSession:
 
         短帧不更新缺失字段；非法帧完全不更新。还没出现过的字段返回 ``None``。
         """
-        if 0 <= index < len(self._latest_values):
+        if 0 <= index < self._channel_count:
             return self._latest_values[index]
         return None
 
     def channel_segment_count(self, index: int) -> int:
-        """通道 ``index``（0 起）当前的分段数。"""
-        return len(self._channel_segments[index])
+        """通道 ``index``（0 起）当前的分段数（O(1)）。"""
+        return self._segment_counts[index]
 
     def channel_segments(self, index: int) -> List[List[tuple[float, int]]]:
         """通道 ``index``（0 起）的缺口分段点序列。
@@ -153,7 +275,20 @@ class OscilloscopeSession:
         缺口两侧切分为不同分段，便于绘图时真正断线。返回的是模型原始点
         的拷贝，绘图调用方不可能反向修改采样存储。
         """
-        return [list(segment) for segment in self._channel_segments[index]]
+        if not -_MAX_CHANNELS <= index < _MAX_CHANNELS:
+            raise IndexError(index)
+        if index < 0:
+            index += _MAX_CHANNELS
+        segments: List[List[tuple[float, int]]] = []
+        current: Optional[List[tuple[float, int]]] = None
+        previous_position = -2
+        for position, relative_seconds, value in self._store.iter_channel_points(index):
+            if position != previous_position + 1:
+                current = []
+                segments.append(current)
+            current.append((relative_seconds, value))
+            previous_position = position
+        return segments
 
     @property
     def records(self) -> List[Union[OscilloscopeFrameRecord, OscilloscopeConnectionBoundary]]:
@@ -161,12 +296,15 @@ class OscilloscopeSession:
 
     @property
     def samples(self) -> List[OscilloscopeSample]:
-        return list(self._samples)
+        return [
+            OscilloscopeSample(relative_seconds, values)
+            for relative_seconds, values in self._store.iter_samples()
+        ]
 
     @property
     def sample_count(self) -> int:
-        """当前保留的原始采样点数（不复制样本列表）。"""
-        return len(self._samples)
+        """当前保留的原始采样点数（O(1)，不复制样本列表）。"""
+        return self._store.count
 
     @property
     def record_count(self) -> int:
@@ -192,10 +330,10 @@ class OscilloscopeSession:
         """
         self._origin_ns = None
         self._records.clear()
-        self._samples.clear()
+        self._store.clear()
         self._channel_count = 0
-        self._latest_values = []
-        self._channel_segments = [[] for _ in range(_MAX_CHANNELS)]
+        self._latest_values = [0] * _MAX_CHANNELS
+        self._segment_counts = [0] * _MAX_CHANNELS
         self._last_sample_had_field = [False] * _MAX_CHANNELS
 
     def note_connection_boundary(
@@ -219,7 +357,12 @@ class OscilloscopeSession:
         return record
 
     def consume(self, event) -> OscilloscopeFrameRecord:
-        """Turn one complete frame into a record, sampling it when legal."""
+        """Turn one complete frame into a record, sampling it when legal.
+
+        提交顺序：先算元数据变更、再写紧凑采样、再写帧记录，全部成功后才
+        淘汰；任何一步 ``MemoryError`` 都不提交本帧、也不淘汰旧窗口，
+        既有采样/时间/通道保持不变（REQ-0005 §7.2.6）。
+        """
         if self._origin_ns is None:
             raise RuntimeError("oscilloscope acquisition has not started")
         monotonic_ns = getattr(event, "monotonic_ns", None)
@@ -236,51 +379,64 @@ class OscilloscopeSession:
             raw_frame=bytes(event.raw_frame),
             values=values,
         )
-        self._records.append(record)
-        # 数据区窗口只看完整帧（合法或非法）：淘汰比最新完整帧早 180 秒的记录。
+        if values is None:
+            self._records.append(record)
+            # 数据区窗口只看完整帧（合法或非法）。
+            self._evict_records_before(relative_seconds - RETENTION_SECONDS)
+            return record
+        metadata_plan = self._plan_sample_metadata(values)
+        self._store.append(relative_seconds, values)
+        try:
+            self._records.append(record)
+        except BaseException:
+            self._store.rollback_last()
+            raise
+        self._apply_sample_metadata(values, metadata_plan)
         self._evict_records_before(relative_seconds - RETENTION_SECONDS)
-        if values is not None:
-            self._samples.append(OscilloscopeSample(relative_seconds, values))
-            # 采样窗口只由最新合法采样推进；非法帧不得影响它（REQ-0005 §7.2.3）。
-            self._evict_samples_before(relative_seconds - RETENTION_SECONDS)
-            self._record_sample(relative_seconds, values)
+        # 采样窗口只由最新合法采样推进；非法帧不得影响它（REQ-0005 §7.2.3）。
+        self._evict_samples_before(relative_seconds - RETENTION_SECONDS)
         return record
 
-    def _record_sample(self, relative_seconds: float, values: tuple[int, ...]) -> None:
-        """保存一条合法采样并为每个实际字段维护缺口分段和最新值。"""
+    def _plan_sample_metadata(
+        self, values: tuple[int, ...]
+    ) -> tuple[List[tuple[int, int]], int]:
+        """提交前先算出元数据变化，保证分配失败时状态未被触碰。"""
+        increments = [
+            (index, self._segment_counts[index] + 1)
+            for index in range(min(len(values), _MAX_CHANNELS))
+            if not self._last_sample_had_field[index]
+        ]
         if len(values) > self._channel_count:
-            self._channel_count = len(values)
-            self._latest_values.extend(
-                [0] * (self._channel_count - len(self._latest_values))
-            )
-        for index in range(_MAX_CHANNELS):
-            if index < len(values):
-                if not self._last_sample_had_field[index]:
-                    self._channel_segments[index].append(deque())
-                self._channel_segments[index][-1].append(
-                    (relative_seconds, values[index])
-                )
-                self._last_sample_had_field[index] = True
-                self._latest_values[index] = values[index]
-            else:
-                self._last_sample_had_field[index] = False
+            channel_count = len(values)
+        else:
+            channel_count = self._channel_count
+        return increments, channel_count
+
+    def _apply_sample_metadata(
+        self, values: tuple[int, ...], plan: tuple[List[tuple[int, int]], int]
+    ) -> None:
+        """只做赋值、不再分配；在采样与帧记录都提交成功后调用。"""
+        increments, channel_count = plan
+        for index, new_count in increments:
+            self._segment_counts[index] = new_count
+        limit = min(len(values), _MAX_CHANNELS)
+        for index in range(limit):
+            self._last_sample_had_field[index] = True
+            self._latest_values[index] = values[index]
+        for index in range(limit, _MAX_CHANNELS):
+            self._last_sample_had_field[index] = False
+        self._channel_count = channel_count
 
     def _evict_samples_before(self, cutoff_seconds: float) -> None:
-        """删除早于 ``cutoff_seconds`` 的原始采样及其分段点。"""
-        while self._samples and self._samples[0].relative_seconds < cutoff_seconds:
-            self._samples.popleft()
-        for segments in self._channel_segments:
-            while segments:
-                first = segments[0]
-                while first and first[0][0] < cutoff_seconds:
-                    first.popleft()
-                if first:
-                    break
-                segments.pop(0)
-        for index, segments in enumerate(self._channel_segments):
-            if not segments:
-                # 该通道的保留点已全部淘汰：下一点与任何已删点之间都是缺口。
-                self._last_sample_had_field[index] = False
+        """删除早于 ``cutoff_seconds`` 的原始采样；分段数按存在性 O(1) 递减。"""
+        store = self._store
+        while store.count and store.oldest_time < cutoff_seconds:
+            width = store.oldest_width
+            next_width = store.width_at(1) if store.count > 1 else 0
+            for index in range(width):
+                if index >= next_width:
+                    self._segment_counts[index] -= 1
+            store.evict_oldest()
 
     def _evict_records_before(self, cutoff_seconds: float) -> None:
         """删除早于 ``cutoff_seconds`` 的完整帧和连接边界记录。"""
