@@ -440,7 +440,17 @@ class SerialController:
             if data:
                 if stop_event.is_set():
                     break
-                self._publish_read(session, data, read_generation)
+                try:
+                    self._publish_read(session, data, read_generation)
+                except Exception as exc:
+                    # 分帧/队列分配失败（含 MemoryError）不得让 reader 抛异常
+                    # 退出后仍看似打开：上报异常并关闭这一条连接。
+                    if not stop_event.is_set():
+                        try:
+                            error_queue.put(exc)
+                        finally:
+                            self._mark_reader_failed(ser, stop_event)
+                    break
             else:
                 stop_event.wait(self._READ_POLL)
 

@@ -178,22 +178,37 @@ class OscilloscopePage(QWidget):
     def is_receiving(self) -> bool:
         return self._receiving
 
+    @property
+    def has_resource_failure(self) -> bool:
+        """绘图/存储资源失败后为 ``True``；只有清空/新建采集才复位。"""
+        return self._resource_failed
+
     def begin_acquisition(self, origin_ns=None) -> None:
         """First successful start establishes ``T+0``; later starts keep it.
 
         ``origin_ns`` is captured before the connection opens, so the first
         framed boundary can never precede the origin (issue 014).
+
+        资源失败后本页不得再次进入接收态；清空/新建采集才复位失败标志，
+        因此主窗口与直接页面调用都不会假装仍在采集。
         """
+        if self._resource_failed:
+            return
         self.session.begin_acquisition(origin_ns)
         self._receiving = True
         self.start_button.setText("停止接收")
         self.state_label.setText("接收中")
 
     def end_acquisition(self) -> None:
-        """Stop receiving but keep every displayed frame and sample."""
+        """Stop receiving but keep every displayed frame and sample.
+
+        资源失败后主窗口的关闭路径也会走这里；此时必须保留
+        “已停止：资源不足”状态与诊断，不能覆盖失败原因。
+        """
         self._receiving = False
         self.start_button.setText("开始接收")
-        self.state_label.setText("已停止")
+        if not self._resource_failed:
+            self.state_label.setText("已停止")
 
     def show_diagnostic(self, text: str) -> None:
         self.diagnostic_label.setText(text or "")
@@ -202,6 +217,14 @@ class OscilloscopePage(QWidget):
     def show_log_error(self, text: str) -> None:
         self.log_error_label.setText(text or "")
         self.log_error_label.setVisible(bool(text))
+
+    def report_resource_failure(self, error: BaseException) -> None:
+        """接收链路侧资源失败（分帧/队列分配）由主窗口转发到此页。
+
+        与绘图失败同一语义：停页保数据、非模态诊断并触发 ``resource_failed``
+        让主窗口关闭物理连接。
+        """
+        self._on_resource_failed(error)
 
     def show_connection_boundary(self, settings, at_ns=None) -> None:
         """恢复接收且参数变化时，在数据区插入连接边界记录（REQ-0005 §11.3）。"""
@@ -214,16 +237,35 @@ class OscilloscopePage(QWidget):
         数据区文本以模型保留记录为准：模型只追加时增量显示；一旦按 180 秒
         窗口淘汰旧记录，就从模型重渲，显示区不会继续积累窗口外文本。
         波形每次都由视口驱动从模型重新生成，绘图 series 不是原始存储。
+
+        存储/记录/数据区分配失败时，已提交的前序帧先尽量落入数据区，
+        然后停页、保留样本并上报 ``resource_failed``；本批剩余帧不再消费。
         """
-        new_records = [self.session.consume(event) for event in events]
-        new_legal = [record for record in new_records if record.values is not None]
-        self._sync_display(new_records)
-        for record in new_legal:
-            for index, value in enumerate(record.values):
-                self._ensure_channel_row(index)
-                self._update_channel_value(f"CH{index + 1}", value)
-        self._sync_view_for_data()
-        self._fit_initial_y(new_legal)
+        new_records = []
+        for event in events:
+            try:
+                new_records.append(self.session.consume(event))
+            except MemoryError as error:
+                try:
+                    self._sync_display(new_records)
+                except MemoryError:
+                    pass
+                self._on_resource_failed(error)
+                return
+        try:
+            new_legal = [
+                record for record in new_records if record.values is not None
+            ]
+            self._sync_display(new_records)
+            for record in new_legal:
+                for index, value in enumerate(record.values):
+                    self._ensure_channel_row(index)
+                    self._update_channel_value(f"CH{index + 1}", value)
+            self._sync_view_for_data()
+            self._fit_initial_y(new_legal)
+        except MemoryError as error:
+            self._on_resource_failed(error)
+            return
         self._render_chart_guarded()
 
     # ------------------------------------------------------- view access
@@ -428,9 +470,10 @@ class OscilloscopePage(QWidget):
         self._resource_failed = True
         self._receiving = False
         self.start_button.setText("开始接收")
-        self.state_label.setText("已停止：绘图资源不足")
+        self.state_label.setText("已停止：资源不足")
         self.show_diagnostic(
-            f"绘图资源不足，已停止波形接收；已采集的原始数据仍保留（{error}）"
+            "示波器资源不足，已停止波形接收；已采集的原始数据仍保留"
+            f"（{error}）。请清空波形/新建采集后重试。"
         )
         self.resource_failed.emit(str(error))
 
@@ -561,6 +604,8 @@ class OscilloscopePage(QWidget):
         self.start_button.setObjectName("oscilloscope_start_button")
         self.clear_button = QPushButton("清空波形")
         self.clear_button.setObjectName("oscilloscope_clear_button")
+        self.log_dir_button = QPushButton("日志目录")
+        self.log_dir_button.setObjectName("oscilloscope_log_dir_button")
         self.follow_button = QPushButton("跟随最新")
         self.follow_button.setObjectName("oscilloscope_follow_button")
         self.follow_button.setCheckable(True)
@@ -585,6 +630,7 @@ class OscilloscopePage(QWidget):
         self.state_label.setObjectName("oscilloscope_state_label")
         toolbar.addWidget(self.start_button)
         toolbar.addWidget(self.clear_button)
+        toolbar.addWidget(self.log_dir_button)
         toolbar.addWidget(self.follow_button)
         toolbar.addWidget(self.auto_scale_button)
         toolbar.addWidget(self.chart_latest_button)

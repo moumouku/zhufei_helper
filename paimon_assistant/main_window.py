@@ -353,6 +353,12 @@ class MainWindow(QMainWindow):
         self.oscilloscope_page.start_requested.connect(self._on_waveform_start_clicked)
         self.oscilloscope_page.stop_requested.connect(self._on_waveform_stop_clicked)
         self.oscilloscope_page.clear_requested.connect(self._on_waveform_clear_clicked)
+        self.oscilloscope_page.resource_failed.connect(
+            self._on_waveform_resource_failed
+        )
+        self.oscilloscope_page.log_dir_button.clicked.connect(
+            self._on_log_dir_clicked
+        )
         for combo in (self.data_bits_combo, self.parity_combo, self.stop_bits_combo):
             combo.currentTextChanged.connect(self._update_serial_summary)
 
@@ -473,7 +479,11 @@ class MainWindow(QMainWindow):
         self.connection_status_label.setToolTip(connection)
         self.connection_status_label.setStyleSheet(f"color: {connection_color};")
 
-        mode = self.parse_mode_combo.currentText()
+        mode = (
+            FRAMED_MODE
+            if self._receive_owner == "waveform"
+            else self.parse_mode_combo.currentText()
+        )
         log_color = COLORS["secondary"]
         if mode == RAW_MODE:
             log_state = "不记录日志"
@@ -521,17 +531,16 @@ class MainWindow(QMainWindow):
         # still be updated without changing the active serial link.
         self.refresh_button.setEnabled(True)
         self.send_button.setEnabled(open_state)
-        primary, secondary = (
-            (self.send_button, self.open_button) if open_state else
-            (self.open_button, self.send_button)
-        )
-        set_primary(secondary, False)
-        set_primary(primary, True)
         self._update_status()
         self._update_page_controls()
 
     def _update_page_controls(self) -> None:
-        """接收期间锁定页面切换；数据页“打开/关闭”只在数据页可用。"""
+        """接收期间锁定页面切换；数据页“打开/关闭”只在数据页可用。
+
+        唯一主操作随当前页面与接收所有权切换：数据页停止时是“打开”、
+        接收中是“发送”；波形页停止时是“开始接收”、接收中是“发送”。
+        被禁用页面的按钮不得保留 ``primary`` 属性（幽灵主操作）。
+        """
         owner = self._receive_owner
         if owner is not None:
             locked_index = 0 if owner == "data" else 1
@@ -547,6 +556,19 @@ class MainWindow(QMainWindow):
             self.open_button.setEnabled(
                 self.page_tabs.currentWidget() is not self.oscilloscope_page
             )
+        on_waveform_page = self.page_tabs.currentWidget() is self.oscilloscope_page
+        if owner is not None:
+            primary = self.send_button
+        elif on_waveform_page:
+            primary = self.oscilloscope_page.start_button
+        else:
+            primary = self.open_button
+        for button in (
+            self.open_button,
+            self.send_button,
+            self.oscilloscope_page.start_button,
+        ):
+            set_primary(button, button is primary)
 
     def _on_page_changed(self, _index: int) -> None:
         self._update_page_controls()
@@ -697,6 +719,10 @@ class MainWindow(QMainWindow):
     def _on_waveform_start_clicked(self) -> None:
         if self.page_tabs.currentWidget() is not self.oscilloscope_page:
             return  # 波形页开始操作只在波形页生效
+        if self.oscilloscope_page.has_resource_failure:
+            # 资源失败后必须先清空/新建采集；不得重开串口假装仍在采集
+            # （诊断已保留失败原因，清空才解除）。
+            return
         if self._is_open:
             return
         try:
@@ -732,6 +758,29 @@ class MainWindow(QMainWindow):
             return
         self._close_connection()
 
+    def _on_waveform_resource_failed(self, _message: str) -> None:
+        """波形页资源失败：走与停止相同的窄路径关闭物理连接并解除锁定。
+
+        页面已保留采样/记录与失败诊断；这里只负责会话边界关闭、队列丢弃
+        和页面锁定恢复，不得让其他路径清掉失败原因。会话重置自身也可能
+        因内存紧张失败，因此最后再尽力丢弃当前队列，避免旧会话残留数据
+        在后续排空中泄漏到数据页。
+        """
+        if self._receive_owner != "waveform":
+            return
+        self._close_connection()
+        for pending in (
+            self.received_queue,
+            self.raw_queue,
+            self.controller.diagnostic_queue,
+            self.error_queue,
+        ):
+            while True:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    break
+
     def _on_waveform_clear_clicked(self) -> None:
         if self.page_tabs.currentWidget() is not self.oscilloscope_page:
             return  # 波形清空只在波形页生效，不得越页清除历史
@@ -761,7 +810,11 @@ class MainWindow(QMainWindow):
 
         事件按当前接收消费者送入数据页或波形页独立历史，再按同一顺序写入
         日志；诊断显示到当前页诊断区，串口错误沿用关闭+弹窗路径。
+
+        本轮排空在开始时固定消费者：波形页资源失败的回调会在处理中途
+        关闭连接并丢弃队列，本批已取出的帧不得改道数据页或二次补收。
         """
+        owner = self._receive_owner
         received_queue = self.received_queue
         error_queue = self.error_queue
 
@@ -772,13 +825,17 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
         if events:
-            if self._receive_owner == "waveform":
+            if owner == "waveform":
                 # 波形帧只进入波形页独立历史，不进入数据页任一通道。
                 self.oscilloscope_page.consume_events(events)
             else:
                 self._event_history.extend(events)
                 self._render_history()
             self._write_events_to_log(events)
+            if owner == "waveform" and self._receive_owner != owner:
+                # 资源失败回调已在会话边界关闭连接并替换队列：本批剩余
+                # 通道数据与旧队列一样属于停止时的未消费数据，直接丢弃。
+                return
 
         # 原始字节通道（REQ-0004 §3.4）：两个通道的队列都取干净，避免切模式时
         # 另一个通道的待处理数据被遗漏（它仍会进入各自的历史）。
@@ -789,7 +846,7 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
         if raw_chunks:
-            if self._receive_owner == "waveform":
+            if owner == "waveform":
                 # 波形会话不消费原始字节；丢弃而不泄漏到数据页历史。
                 # （波形页与数据页原始字节模式的隔离由 issue 013 完整交付。）
                 raw_chunks = []
@@ -807,7 +864,7 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
         if diagnostics:
-            if self._receive_owner == "waveform":
+            if owner == "waveform":
                 self.oscilloscope_page.show_diagnostic(str(diagnostics[-1]))
             else:
                 self.receive_error_label.setText(str(diagnostics[-1]))
@@ -838,9 +895,7 @@ class MainWindow(QMainWindow):
             if written or self._log_error_shown:
                 continue
             self._log_error_shown = True
-            self.log_error_label.setText(_LOG_WRITE_FAILED_TEXT)
-            self.log_error_label.setVisible(True)
-            self.oscilloscope_page.show_log_error(_LOG_WRITE_FAILED_TEXT)
+            self._show_log_failure(_LOG_WRITE_FAILED_TEXT)
         self._update_status()
 
     @property
@@ -993,27 +1048,38 @@ class MainWindow(QMainWindow):
     def _handle_error(self, err) -> None:
         if not self._is_open:
             return
+        if isinstance(err, MemoryError) and self._receive_owner == "waveform":
+            # 接收线程分帧/队列分配失败属于页面内资源故障：沿用非模态
+            # 诊断并关闭物理连接，不弹连接错误对话框。
+            self.oscilloscope_page.report_resource_failure(err)
+            return
         message = err if isinstance(err, str) else str(err)
         self._close_connection()
         QMessageBox.critical(self, "串口错误", message)
 
     # --------------------------------------------------------- log entry
 
+    def _show_log_failure(self, text: str) -> None:
+        """日志错误提示同步到数据页与波形页（两页共用同一日志服务）。"""
+        self.log_error_label.setText(text)
+        self.log_error_label.setVisible(bool(text))
+        self.oscilloscope_page.show_log_error(text)
+
     def _on_log_dir_clicked(self) -> None:
         """先确保日志目录存在，再用注入的打开器打开目录本身。
 
-        创建或打开失败只更新错误标签，不影响接收链路与串口连接。
+        数据页与波形页共用本入口；创建或打开失败只更新非模态错误
+        标签，不影响接收链路与串口连接。
         """
         try:
             self._log_service.ensure_directory()
             self._log_dir_opener(self._log_service.log_dir)
         except Exception as exc:
-            self.log_error_label.setText(f"日志目录打开失败：{exc}")
+            self._show_log_failure(f"日志目录打开失败：{exc}")
         else:
-            self.log_error_label.setText(
+            self._show_log_failure(
                 _LOG_WRITE_FAILED_TEXT if self._log_service.failed else ""
             )
-        self.log_error_label.setVisible(bool(self.log_error_label.text()))
         self._update_status()
 
     # --------------------------------------------------------------- clear
