@@ -109,6 +109,34 @@ QMainWindow, QMessageBox {{
     background-color: {c['window']};
     color: {c['text']};
 }}
+QTabWidget::pane {{
+    border: 1px solid {c['divider']};
+    border-radius: {s['radius']}px;
+    top: -1px;
+}}
+QTabBar::tab {{
+    background-color: {c['panel']};
+    color: {c['secondary']};
+    border: {s['border']}px solid {c['divider']};
+    border-bottom: none;
+    border-top-left-radius: {s['radius']}px;
+    border-top-right-radius: {s['radius']}px;
+    padding: {s['padding_y']}px {s['padding_x']}px;
+    margin-right: 2px;
+}}
+QTabBar::tab:selected {{
+    background-color: {c['receive']};
+    color: {c['text']};
+    border-color: {c['border']};
+}}
+QTabBar::tab:!selected:hover {{
+    background-color: {c['hover']};
+}}
+QTabBar::tab:disabled {{
+    color: {c['muted']};
+    background-color: {c['window']};
+    border-color: {c['divider']};
+}}
 QLabel {{
     background-color: transparent;
     color: {c['secondary']};

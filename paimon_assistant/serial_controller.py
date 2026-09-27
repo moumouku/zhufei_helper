@@ -80,12 +80,19 @@ class _ReceiveSession:
 
     __slots__ = ("generation", "framer", "received_queue", "diagnostic_queue", "raw_queue")
 
-    def __init__(self, generation: int, clock_ms: Callable[[], int]) -> None:
+    def __init__(
+        self,
+        generation: int,
+        clock_ms: Callable[[], int],
+        monotonic_ns: Optional[Callable[[], int]] = None,
+    ) -> None:
         self.generation = generation
         self.received_queue: queue.Queue = queue.Queue()
         self.diagnostic_queue: queue.Queue = queue.Queue()
         self.raw_queue: queue.Queue = queue.Queue()
-        self.framer = ReceiveFramer(clock_ms, on_overflow=self._on_overflow)
+        self.framer = ReceiveFramer(
+            clock_ms, on_overflow=self._on_overflow, monotonic_ns=monotonic_ns
+        )
 
     def _on_overflow(self) -> None:
         # Reads the current queue at call time so a reset that swapped the
@@ -105,6 +112,7 @@ class SerialController:
         serial_factory: Optional[Callable[..., Any]] = None,
         port_lister: Optional[Callable[[], List[Any]]] = None,
         clock_ms: Optional[Callable[[], int]] = None,
+        monotonic_ns: Optional[Callable[[], int]] = None,
     ) -> None:
         if serial_factory is None:
             serial_factory = _serial.Serial if _serial is not None else None
@@ -114,9 +122,12 @@ class SerialController:
             )
         if clock_ms is None:
             clock_ms = _epoch_ms
+        if monotonic_ns is None:
+            monotonic_ns = time.monotonic_ns
         self._factory = serial_factory
         self._port_lister = port_lister
         self._clock_ms = clock_ms
+        self._monotonic_ns = monotonic_ns
         self.received_queue: queue.Queue = queue.Queue()
         self.diagnostic_queue: queue.Queue = queue.Queue()
         self.raw_queue: queue.Queue = queue.Queue()
@@ -193,7 +204,9 @@ class SerialController:
         stop_event = threading.Event()
         with self._session_lock:
             self._generation += 1
-            session = _ReceiveSession(self._generation, self._clock_ms)
+            session = _ReceiveSession(
+                self._generation, self._clock_ms, self._monotonic_ns
+            )
             reader = threading.Thread(
                 target=self._reader_loop,
                 args=(ser, stop_event, session, error_queue),

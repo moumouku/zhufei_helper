@@ -14,11 +14,17 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ReceivedEvent:
-    """One complete data frame plus the time its `0D 0A` boundary was read."""
+    """One complete data frame plus the time its `0D 0A` boundary was read.
+
+    ``monotonic_ns`` is the high-resolution monotonic time captured at the same
+    boundary recognition point (REQ-0005 §6.1). It is ``None`` when the framer
+    was built without a monotonic clock, keeping the REQ-0003 contract intact.
+    """
 
     received_at_ms: int
     payload: bytes
     raw_frame: bytes
+    monotonic_ns: int | None = None
 
     def __post_init__(self) -> None:
         # Copy at construction so a reused caller buffer can never mutate
@@ -30,10 +36,17 @@ class ReceivedEvent:
 class ReceiveFramer:
     """Turns consecutive raw byte blocks into complete framing events."""
 
-    def __init__(self, clock_ms, max_payload_bytes=1_048_576, on_overflow=None):
+    def __init__(
+        self,
+        clock_ms,
+        max_payload_bytes=1_048_576,
+        on_overflow=None,
+        monotonic_ns=None,
+    ):
         self._clock_ms = clock_ms
         self._max_payload_bytes = max_payload_bytes
         self._on_overflow = on_overflow
+        self._monotonic_ns = monotonic_ns
         self._buffer = bytearray()
         self._pending_cr = False
         self._discarding = False
@@ -61,7 +74,20 @@ class ReceiveFramer:
                 self._pending_cr = False
                 if byte == 0x0A:
                     payload = bytes(self._buffer)
-                    events.append(ReceivedEvent(self._clock_ms(), payload, payload + b"\r\n"))
+                    received_at_ms = self._clock_ms()
+                    monotonic_ns = (
+                        self._monotonic_ns()
+                        if self._monotonic_ns is not None
+                        else None
+                    )
+                    events.append(
+                        ReceivedEvent(
+                            received_at_ms,
+                            payload,
+                            payload + b"\r\n",
+                            monotonic_ns,
+                        )
+                    )
                     self._buffer.clear()
                     continue
                 self._buffer.append(0x0D)

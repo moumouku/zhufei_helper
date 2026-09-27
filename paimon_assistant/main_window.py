@@ -5,12 +5,17 @@ an in-memory history; the display is rendered from that history with the current
 mode / encoding / timestamp settings.
 Ports are polled every second via PortMonitor and the combo box is updated
 by diff (add/remove only), sharing one path with the manual refresh button.
+
+The window hosts two pages: the existing data page and the oscilloscope page.
+Both share the serial port/settings, the send controls and the RX log service,
+but at most one page consumes the physical connection at a time.
 """
 
 from __future__ import annotations
 
 import os
 import queue
+import time
 
 from PySide6.QtCore import QSignalBlocker, Qt, QTimer
 from PySide6.QtGui import QTextCursor
@@ -28,12 +33,15 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStatusBar,
     QStyle,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .codec import IncrementalTextDecoder, encode_text, format_hex, parse_hex_input
 from .config import BAUD_RATES, SerialSettings
+from .oscilloscope import OscilloscopeSession
+from .oscilloscope_page import OscilloscopePage
 from .port_monitor import PortMonitor
 from .receive_buffer import ReceiveBuffer
 from .receive_framer import ReceivedEvent
@@ -62,10 +70,20 @@ class MainWindow(QMainWindow):
     """极简串口助手主窗口：枚举/打开/关闭/收发/清空。"""
 
     def __init__(
-        self, controller=None, parent=None, *, log_service=None, log_dir_opener=None
+        self,
+        controller=None,
+        parent=None,
+        *,
+        log_service=None,
+        log_dir_opener=None,
+        monotonic_ns=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("派蒙助手")
+        # 示波器采集原点与接收线程帧时间戳共用的高分辨率单调时钟（可注入）。
+        self._monotonic_ns = (
+            monotonic_ns if monotonic_ns is not None else time.monotonic_ns
+        )
         self.controller = controller if controller is not None else SerialController()
         self._log_service = (
             log_service if log_service is not None else ReceiveLogService()
@@ -87,6 +105,7 @@ class MainWindow(QMainWindow):
         )
 
         self._is_open = False
+        self._receive_owner: str | None = None
         self._active_settings: SerialSettings | None = None
         self._event_history: list[ReceivedEvent] = []
         self._raw_history = ReceiveBuffer()
@@ -125,7 +144,24 @@ class MainWindow(QMainWindow):
         margin = SIZES["page_margin"]
         root.setContentsMargins(margin, margin, margin, margin)
         root.setSpacing(SIZES["spacing"])
+        # 连接栏（端口/串口参数/编码）为数据页与波形页共用（REQ-0005 §4.1.2）。
         self._build_connection_bar(root)
+
+        # “数据/波形”页面：启动默认数据页；接收期间页面切换被锁定。
+        self.page_tabs = QTabWidget()
+        self.page_tabs.setObjectName("page_tabs")
+        self._data_page = QWidget()
+        self._data_page.setObjectName("data_page")
+        self.page_tabs.addTab(self._data_page, "数据")
+        self.oscilloscope_page = OscilloscopePage(
+            OscilloscopeSession(monotonic_ns=self._monotonic_ns), self
+        )
+        self.page_tabs.addTab(self.oscilloscope_page, "波形")
+        root.addWidget(self.page_tabs, 1)
+
+        data_layout = QVBoxLayout(self._data_page)
+        data_layout.setContentsMargins(0, 0, 0, 0)
+        data_layout.setSpacing(SIZES["spacing"])
 
         # 接收工具栏：显示方式、解析、时间戳，以及接收区操作。
         receive_row = QHBoxLayout()
@@ -156,7 +192,7 @@ class MainWindow(QMainWindow):
         receive_row.addStretch(1)
         receive_row.addWidget(self.clear_button)
         receive_row.addWidget(self.log_dir_button)
-        root.addLayout(receive_row)
+        data_layout.addLayout(receive_row)
 
         # 日志错误靠近日志入口，接收诊断紧邻接收区；空提示不占高度。
         self.log_error_label = QLabel("")
@@ -170,15 +206,15 @@ class MainWindow(QMainWindow):
             label.setWordWrap(True)
             label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             label.setVisible(False)
-            root.addWidget(label)
+            data_layout.addWidget(label)
 
         # 接收区占据剩余空间。
         self.display_edit = QPlainTextEdit()
         self.display_edit.setFont(data_font())
         self.display_edit.setReadOnly(True)
-        root.addWidget(self.display_edit, 1)
+        data_layout.addWidget(self.display_edit, 1)
 
-        # 发送模式紧邻输入框；编码仍与接收共用。
+        # 发送模式紧邻输入框；编码仍与接收共用（发送能力为两页共用）。
         send_row = QHBoxLayout()
         send_row.setSpacing(SIZES["spacing"])
         self.send_mode_combo = QComboBox()
@@ -307,6 +343,10 @@ class MainWindow(QMainWindow):
         scrollbar.valueChanged.connect(self._on_display_scroll_changed)
         self.parse_mode_combo.currentIndexChanged.connect(self._on_parse_mode_changed)
         self.serial_parameters_button.toggled.connect(self._on_serial_parameters_toggled)
+        self.page_tabs.currentChanged.connect(self._on_page_changed)
+        self.oscilloscope_page.start_requested.connect(self._on_waveform_start_clicked)
+        self.oscilloscope_page.stop_requested.connect(self._on_waveform_stop_clicked)
+        self.oscilloscope_page.clear_requested.connect(self._on_waveform_clear_clicked)
         for combo in (self.data_bits_combo, self.parity_combo, self.stop_bits_combo):
             combo.currentTextChanged.connect(self._update_serial_summary)
 
@@ -453,12 +493,16 @@ class MainWindow(QMainWindow):
             "等待完整帧，对端需以 \\r\\n 结束；未知协议可切换到原始字节。"
         )
 
-    def _set_open_state(self, open_state: bool) -> None:
+    def _set_open_state(self, open_state: bool, *, owner: str | None = None) -> None:
         self._is_open = open_state
+        self._receive_owner = owner if open_state else None
         if not open_state:
             self._active_settings = None
-        self.open_button.setText("关闭" if open_state else "打开")
-        self.open_button.setIcon(self._close_icon if open_state else self._open_icon)
+        data_receiving = open_state and self._receive_owner == "data"
+        self.open_button.setText("关闭" if data_receiving else "打开")
+        self.open_button.setIcon(
+            self._close_icon if data_receiving else self._open_icon
+        )
         for widget in (
             self.port_combo,
             self.baud_combo,
@@ -478,13 +522,44 @@ class MainWindow(QMainWindow):
         set_primary(secondary, False)
         set_primary(primary, True)
         self._update_status()
+        self._update_page_controls()
+
+    def _update_page_controls(self) -> None:
+        """接收期间锁定页面切换；数据页“打开/关闭”只在数据页可用。"""
+        owner = self._receive_owner
+        if owner is not None:
+            locked_index = 0 if owner == "data" else 1
+            if self.page_tabs.currentIndex() != locked_index:
+                with QSignalBlocker(self.page_tabs):
+                    self.page_tabs.setCurrentIndex(locked_index)
+        self.page_tabs.tabBar().setEnabled(owner is None)
+        if owner == "data":
+            self.open_button.setEnabled(True)  # 此时是数据页的“关闭”
+        elif owner == "waveform":
+            self.open_button.setEnabled(False)
+        else:
+            self.open_button.setEnabled(
+                self.page_tabs.currentWidget() is not self.oscilloscope_page
+            )
+
+    def _on_page_changed(self, _index: int) -> None:
+        self._update_page_controls()
 
     def _close_connection(self) -> None:
+        waveform_receiving = self._receive_owner == "waveform"
         self._monitor.clear_connected()
         try:
             self.controller.close()
         except Exception:
             pass
+        if waveform_receiving:
+            # 串口已关闭，但旧连接的待处理帧可能仍在队列中；替换队列
+            # 丢弃它们，停止后再 drain 不得补收（REQ-0005 §4.3.3）。
+            try:
+                self.controller.reset_receive_session()
+            except Exception:
+                pass
+            self.oscilloscope_page.end_acquisition()
         self._set_open_state(False)
 
     # --------------------------------------------------------- enumeration
@@ -559,37 +634,73 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------- open / close
 
+    def _build_settings(self) -> SerialSettings:
+        port = self.port_combo.currentText().strip()
+        if not port:
+            raise ValueError("请选择要打开的串口")
+        return SerialSettings(
+            port=port,
+            baudrate=int(self.baud_combo.currentText().strip()),
+            data_bits=int(self.data_bits_combo.currentText()),
+            parity=self.parity_combo.currentText(),
+            stop_bits=float(self.stop_bits_combo.currentText()),
+        )
+
     def _on_open_clicked(self) -> None:
+        if self._receive_owner == "waveform":
+            return  # 波形页接收中：数据页不能接管或关闭物理连接
         if self._is_open:
             self._close_connection()
             return
         try:
-            port = self.port_combo.currentText().strip()
-            if not port:
-                raise ValueError("请选择要打开的串口")
-            settings = SerialSettings(
-                port=port,
-                baudrate=int(self.baud_combo.currentText().strip()),
-                data_bits=int(self.data_bits_combo.currentText()),
-                parity=self.parity_combo.currentText(),
-                stop_bits=float(self.stop_bits_combo.currentText()),
-            )
+            settings = self._build_settings()
             self.controller.open(settings)
         except Exception as exc:
             self._set_open_state(False)
             QMessageBox.critical(self, "打开失败", str(exc))
             return
         self._active_settings = settings
-        self._set_open_state(True)
-        self._monitor.set_connected(port)
+        self._set_open_state(True, owner="data")
+        self._monitor.set_connected(settings.port)
+
+    # ------------------------------------------------------- waveform page
+
+    def _on_waveform_start_clicked(self) -> None:
+        if self._is_open:
+            return
+        try:
+            settings = self._build_settings()
+            self.controller.open(settings)
+        except Exception as exc:
+            self._set_open_state(False)
+            QMessageBox.critical(self, "打开失败", str(exc))
+            return
+        self._active_settings = settings
+        self.oscilloscope_page.begin_acquisition()
+        self._set_open_state(True, owner="waveform")
+        self._monitor.set_connected(settings.port)
+
+    def _on_waveform_stop_clicked(self) -> None:
+        if self._receive_owner != "waveform":
+            return
+        self._close_connection()
+
+    def _on_waveform_clear_clicked(self) -> None:
+        if self._receive_owner == "waveform":
+            # 清空是会话内线性化点：先丢弃尚未处理的队列数据（REQ-0005 §9.2）。
+            try:
+                self.controller.reset_receive_session()
+            except Exception:
+                pass
+        self.oscilloscope_page.clear_acquisition()
 
     # ------------------------------------------------------------- receive
 
     def _drain_queues(self) -> None:
         """批量取出接收事件/分帧诊断/串口错误。
 
-        事件先进历史并按当前设置重渲显示，再按同一顺序写入日志；
-        诊断显示到 ``receive_error_label``，串口错误沿用关闭+弹窗路径。
+        事件按当前接收消费者送入数据页或波形页独立历史，再按同一顺序写入
+        日志；诊断显示到当前页诊断区，串口错误沿用关闭+弹窗路径。
         """
         received_queue = self.received_queue
         error_queue = self.error_queue
@@ -601,8 +712,12 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
         if events:
-            self._event_history.extend(events)
-            self._render_history()
+            if self._receive_owner == "waveform":
+                # 波形帧只进入波形页独立历史，不进入数据页任一通道。
+                self.oscilloscope_page.consume_events(events)
+            else:
+                self._event_history.extend(events)
+                self._render_history()
             self._write_events_to_log(events)
 
         # 原始字节通道（REQ-0004 §3.4）：两个通道的队列都取干净，避免切模式时
@@ -614,9 +729,14 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
         if raw_chunks:
-            for chunk in raw_chunks:
-                self._raw_history.append(chunk)
-            self._render_history()
+            if self._receive_owner == "waveform":
+                # 波形会话不消费原始字节；丢弃而不泄漏到数据页历史。
+                # （波形页与数据页原始字节模式的隔离由 issue 013 完整交付。）
+                raw_chunks = []
+            else:
+                for chunk in raw_chunks:
+                    self._raw_history.append(chunk)
+                self._render_history()
 
         # 分帧诊断（超长帧）独立队列；控制器契约保证该队列存在（REQ-0003 §5.1.6）。
         diagnostic_queue = self.controller.diagnostic_queue
@@ -627,8 +747,13 @@ class MainWindow(QMainWindow):
             except queue.Empty:
                 break
         if diagnostics:
-            self.receive_error_label.setText(str(diagnostics[-1]))
-            self.receive_error_label.setVisible(bool(self.receive_error_label.text()))
+            if self._receive_owner == "waveform":
+                self.oscilloscope_page.show_diagnostic(str(diagnostics[-1]))
+            else:
+                self.receive_error_label.setText(str(diagnostics[-1]))
+                self.receive_error_label.setVisible(
+                    bool(self.receive_error_label.text())
+                )
 
         errors = []
         while True:
@@ -655,6 +780,7 @@ class MainWindow(QMainWindow):
             self._log_error_shown = True
             self.log_error_label.setText(_LOG_WRITE_FAILED_TEXT)
             self.log_error_label.setVisible(True)
+            self.oscilloscope_page.show_log_error(_LOG_WRITE_FAILED_TEXT)
         self._update_status()
 
     @property
@@ -831,6 +957,8 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------- clear
 
     def _on_clear(self) -> None:
+        if self._receive_owner == "waveform":
+            return  # 数据页清空不得重置波形会话（页面历史隔离）
         # 清空的唯一线性化点（REQ-0003 §10.1）：reset_receive_session() 在会话锁内
         # 递增代次、重置分帧器（丢弃未完成尾部与超长状态）并用新队列丢弃点击时
         # 尚未 drain 的旧事件。未打开时也安全，不会创建串口连接。

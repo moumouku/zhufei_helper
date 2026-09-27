@@ -245,3 +245,23 @@ class TestOverflow:
         framer = ReceiveFramer(clock_ms=FakeClock(1000), max_payload_bytes=4)
         assert framer.feed(b"abcd\r\r\n") == []
         assert framer.feed(b"ok\r\n") == [ReceivedEvent(1000, b"ok", b"ok\r\n")]
+
+
+class TestBoundaryMonotonicTime:
+    """REQ-0005 §6.1: the frame boundary must carry both clocks, captured
+    while the reader recognizes ``0D 0A`` — never a later consumption time."""
+
+    def test_injected_monotonic_clock_stamps_the_frame_boundary(self):
+        framer = ReceiveFramer(
+            clock_ms=FakeClock(1000), monotonic_ns=FakeClock(5_000_000_000)
+        )
+
+        events = framer.feed(b"A\r\n")
+
+        assert events[0].received_at_ms == 1000
+        assert events[0].monotonic_ns == 5_000_000_000
+
+    def test_event_without_monotonic_source_keeps_none(self):
+        framer = ReceiveFramer(clock_ms=FakeClock(1000))
+
+        assert framer.feed(b"A\r\n")[0].monotonic_ns is None
