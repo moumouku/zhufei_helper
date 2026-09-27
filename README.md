@@ -4,8 +4,8 @@
 
 版本状态：
 
-- 源码开发版本：`v0.6.0`（未发布，新增独立“波形”页）
-- 最新已发布 EXE：`v0.5.0`
+- 当前分支的源码与 EXE：`v0.6.0` 开发构建，包含独立“波形”页
+- 最新正式 GitHub Release：`v0.5.0`；`v0.6.0` 尚未创建 Release
 
 完整操作步骤见 [docs/user-manual.md](docs/user-manual.md)。
 按功能独立管理的需求文档见 [docs/requirements/index.md](docs/requirements/index.md)。
@@ -21,15 +21,16 @@
 PaimonAssistant.exe
 ```
 
-- 仓库内直接获取（点开文件页面右上角的 Download raw file）：<https://github.com/moumouku/zhufei_helper/blob/main/PaimonAssistant.exe>
-- `v0.5.0` 发布页：<https://github.com/moumouku/zhufei_helper/releases/tag/v0.5.0>
+- **直接下载 v0.6.0 EXE**：[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/heads/feature/req-0005-integration/PaimonAssistant.exe)
+- 当前分支文件页：<https://github.com/moumouku/zhufei_helper/blob/feature/req-0005-integration/PaimonAssistant.exe>
+- 历史正式版本 `v0.5.0`：<https://github.com/moumouku/zhufei_helper/releases/tag/v0.5.0>
 
-注意：仓库根目录的 `PaimonAssistant.exe` 仍是最新已发布版本 `v0.5.0` 的构建产物，**不包含 `v0.6.0` 源码版本的“波形”页**。下面的 SHA256 与发布链接对应该已发布版本，保持不变；要体验 `v0.6.0` 请按“运行”一节从源码启动。
+当前分支根目录的 `PaimonAssistant.exe` 为已验证的 `v0.6.0` 开发构建，支持小数波形和原始载荷正文。下载后即可运行；文件大小为 49,218,386 字节。`main` 和最新正式 Release 仍为 `v0.5.0`，需要波形功能时请使用上面的 v0.6.0 下载链接。
 
 当前文件 SHA256：
 
 ```text
-20a7c6b82306b6aeb3ebec70be40e20f4f77d3f1797d9e5bf8be3ed3177e5e07
+c8842a33a91d62710ceb81f5763f71940050742dc0961c039771c44693987eca
 ```
 
 下载后可用下面的命令校验：
@@ -72,7 +73,7 @@ Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
 
 ## 波形页（v0.6.0 源码开发版本）
 
-“波形”页是 `v0.6.0` 源码开发版本新增的独立页面，尚未包含在根目录 `v0.5.0` EXE 中。它使用自己的严格 `\r\n` 分帧器和十进制数值协议解析器，与数据页互斥地共用同一个物理串口。
+“波形”页已包含在本分支根目录的 `v0.6.0` EXE 和源码中。它使用自己的严格 `\r\n` 分帧器和十进制数值协议解析器，与数据页互斥地共用同一个物理串口。
 
 - **页面与接收互斥**：启动默认进入“数据”页。同一时刻最多只有一页接收；开始接收后页面切换被锁定，必须停止接收（关闭物理串口）后才能切页。切页后另一页保持停止，需手动开始；两页的接收历史、分帧器、解析状态和清空操作完全独立，互不回放历史。
 - **十进制数值协议**：严格以连续 `0D 0A` 作为唯一帧结束边界。完整载荷必须是 1～8 个 ASCII 有符号十进制数值，语法为 `[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(,[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)){0,7}`，取值范围为 `-2147483648..2147483647`；兼容整数、正负号和前导零，也接受 `0.96`、`.5`、`1.`。不接受空格、TAB、空字段、尾逗号、指数、`NaN`、`Inf`、HEX 或超过 8 个字段。合法帧产生采样；完整非法帧仍显示原始载荷，但在正文外标记“解析失败”，不产生点、不改变通道数。所有完整帧都按既有 RX 格式写日志，未完成帧和超过 1 MiB 后丢弃的帧不写日志。

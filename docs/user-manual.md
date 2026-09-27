@@ -4,38 +4,42 @@
 
 派蒙助手是一款 Windows 串口调试上位机，适用于嵌入式设备、开发板和串口模块的收发调试。
 
-“数据”页只负责原始字节的收发和显示，不解析设备协议；接收数据可以按文本或 HEX 显示，发送数据也可以选择文本或 HEX。源码开发版本 v0.6.0 新增独立的“波形”页，按十进制数值协议解析并绘制波形；该页尚未包含在最新已发布 EXE（v0.5.0）中。
+“数据”页只负责原始字节的收发和显示，不解析设备协议；接收数据可以按文本或 HEX 显示，发送数据也可以选择文本或 HEX。源码与当前分支的 v0.6.0 开发构建新增独立的“波形”页，按十进制数值协议解析并绘制波形；下载见 2.1。
 
 ## 2. 启动软件
 
 ### 2.1 使用已打包版本
 
-从 GitHub Release 下载单文件程序：
+直接下载含波形页的 v0.6.0 单文件程序：
 
-```text
-https://github.com/moumouku/zhufei_helper/releases/latest
-```
+[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/heads/feature/req-0005-integration/PaimonAssistant.exe)
 
 下载 `PaimonAssistant.exe` 后双击运行即可。打包版本不需要目标电脑安装 Python，也不需要安装任何依赖。
 
-最新已发布版本为 `v0.5.0`，不包含“波形”页；`v0.6.0` 是尚未发布的源码开发版本，请按 2.2 从源码运行。
+当前分支根目录的 EXE 与源码均为 v0.6.0 开发构建，已包含“波形”页。最新正式 [GitHub Release](https://github.com/moumouku/zhufei_helper/releases/tag/v0.5.0) 仍为 v0.5.0，不包含波形页。
 
-Release 页面的发布说明里给出了该文件的 SHA256，可在下载后校验：
+v0.6.0 下载文件的 SHA256 为：
+
+```text
+c8842a33a91d62710ceb81f5763f71940050742dc0961c039771c44693987eca
+```
+
+在 PowerShell 中校验下载文件的 SHA256：
 
 ```powershell
 Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
 ```
 
-在开发环境中也可以直接运行本地构建产物：
+在当前主工作区可直接运行已验证的程序：
 
 ```text
-E:\projects_learning\zhufei_helps\dist\PaimonAssistant.exe
+E:\projects_learning\zhufei_helps\PaimonAssistant.exe
 ```
 
-也可以在 PowerShell 中执行：
+也可以在 PowerShell 中启动：
 
 ```powershell
-& "E:\projects_learning\zhufei_helps\dist\PaimonAssistant.exe"
+& "E:\projects_learning\zhufei_helps\PaimonAssistant.exe"
 ```
 
 ### 2.2 使用源码版本
@@ -264,7 +268,7 @@ HEX 模式适合检查协议帧、控制字节、零字节和非文本数据。
 
 ## 7. 波形页（示波器）
 
-“波形”页是源码开发版本 v0.6.0 新增的独立页面，用于接收并绘制以 `\r\n` 结束的十进制数值波形协议；它尚未包含在最新已发布 EXE（v0.5.0）中。
+“波形”页已包含在本分支的 v0.6.0 EXE 和源码中，用于接收并绘制以 `\r\n` 结束的十进制数值波形协议。
 
 ### 7.1 页面、接收互斥与切换
 
