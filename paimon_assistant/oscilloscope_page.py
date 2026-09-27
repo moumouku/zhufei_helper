@@ -11,7 +11,7 @@ only receive consumer.
 from __future__ import annotations
 
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from .oscilloscope import (
+    OscilloscopeConnectionBoundary,
     OscilloscopeSession,
     format_connection_boundary_line,
     format_frame_line,
@@ -44,6 +45,16 @@ class OscilloscopePage(QWidget):
         self.setObjectName("oscilloscope_page")
         self.session = session
         self._receiving = False
+        self._rendering_history = False
+        #: 页面已送入数据区的模型记录数；用于检测模型是否淘汰了旧记录。
+        self._records_rendered = 0
+        #: 页面已送入绘图 series 的模型采样点数；用于检测模型是否淘汰了旧点。
+        self._samples_rendered = 0
+        #: “跟随最新”默认开启；用户上翻后暂停，只有点击“回到最新”才恢复。
+        self._follow_latest = True
+        self._user_scroll_pending = False
+        self._scroll_settle_generation = 0
+        self._scroll_anchor_value = None
         self._build_ui()
         self._connect_signals()
 
@@ -81,21 +92,105 @@ class OscilloscopePage(QWidget):
     def show_connection_boundary(self, settings, at_ns=None) -> None:
         """恢复接收且参数变化时，在数据区插入连接边界记录（REQ-0005 §11.3）。"""
         record = self.session.note_connection_boundary(settings, at_ns)
-        self.display_edit.appendPlainText(format_connection_boundary_line(record))
+        self._sync_display([record])
 
     def consume_events(self, events) -> None:
-        """完整帧 → 数据区记录；合法帧另产生采样、图表点和通道最新值。"""
-        for event in events:
-            record = self.session.consume(event)
-            self.display_edit.appendPlainText(format_frame_line(record))
-            if record.values is not None:
-                self._append_sample(record.relative_seconds, record.values)
+        """完整帧 → 数据区记录；合法帧另产生采样、图表点和通道最新值。
+
+        数据区文本以模型保留记录为准：模型只追加时增量显示；一旦按 180 秒
+        窗口淘汰旧记录，就从模型重渲，显示区不会继续积累窗口外文本。
+        """
+        new_records = [self.session.consume(event) for event in events]
+        new_legal = [record for record in new_records if record.values is not None]
+        self._sync_display(new_records)
+        self._sync_chart(new_legal)
         self._fit_axes()
+
+    def _sync_display(self, new_records) -> None:
+        """模型只追加时保留现有文本和阅读位置；发生淘汰时从模型重渲。"""
+        if self.session.record_count != self._records_rendered + len(new_records):
+            self._render_history()
+            return
+        for record in new_records:
+            self.display_edit.appendPlainText(self._format_record(record))
+        self._records_rendered += len(new_records)
+        if self._follow_latest:
+            self._scroll_to_end()
+            self._begin_scroll_settle()
+
+    def _sync_chart(self, new_legal) -> None:
+        """模型只追加时按增量续点；一旦模型淘汰了旧采样就从模型重建。"""
+        if self._samples_rendered + len(new_legal) != self.session.sample_count:
+            self._rebuild_chart_series()
+        else:
+            for record in new_legal:
+                self._append_sample(record.relative_seconds, record.values)
+        self._samples_rendered = self.session.sample_count
+
+    def _rebuild_chart_series(self) -> None:
+        """用模型保留的缺口分段点重建全部 series，使图表与模型一致。
+
+        通道最新值和通道栏行从模型恢复；通道开关状态保留，只看模型实际
+        保留的点，不保留任何已被 180 秒窗口淘汰的绘制点。
+        """
+        for series_list in self.channel_series.values():
+            for series in series_list:
+                self.chart.removeSeries(series)
+                series.deleteLater()
+        self.channel_series = {}
+        self.ch1_series = None
+        for index in range(self.session.channel_count):
+            self._ensure_channel_row(index)
+            latest = self.session.channel_latest_value(index)
+            if latest is not None:
+                self._update_channel_value(f"CH{index + 1}", latest)
+            first_series = None
+            for points in self.session.channel_segments(index):
+                series = self._add_channel_segment(index)
+                if first_series is None:
+                    first_series = series
+                for relative_seconds, value in points:
+                    series.append(float(relative_seconds), float(value))
+            if first_series is None:
+                first_series = self._add_channel_segment(index)
+            if index == 0:
+                self.ch1_series = first_series
+        if self.ch1_series is None:
+            self.ch1_series = self._add_channel_segment(0)
+
+    def _render_history(self) -> None:
+        """从模型当前保留的记录重渲数据区（记录淘汰或清空后调用）。
+
+        重渲尊重跟随状态：跟随开启滚动到末尾；暂停时按旧文本前缀或比例
+        保留阅读位置，数据继续进入模型和文本但不强制移动视口。
+        """
+        if self._rendering_history:
+            return
+        anchor = self._capture_display_anchor()
+        self._rendering_history = True
+        try:
+            text = "\n".join(
+                self._format_record(record) for record in self.session.records
+            )
+            self.display_edit.setPlainText(text)
+            self._records_rendered = self.session.record_count
+            self._restore_display_anchor(anchor, text)
+            self._begin_scroll_settle()
+        finally:
+            self._rendering_history = False
+
+    @staticmethod
+    def _format_record(record) -> str:
+        if isinstance(record, OscilloscopeConnectionBoundary):
+            return format_connection_boundary_line(record)
+        return format_frame_line(record)
 
     def clear_acquisition(self) -> None:
         """清空波形/新建采集：重置时间原点、历史、图表和通道栏。"""
         was_receiving = self._receiving
         self.session.reset()
+        self._records_rendered = 0
+        self._samples_rendered = 0
         if was_receiving:
             # 活动接收清空立即以清空时刻重设 T+0；后续完整帧按新原点计时。
             self.session.begin_acquisition()
@@ -104,6 +199,8 @@ class OscilloscopePage(QWidget):
         self.axis_x.setRange(0.0, 1.0)
         self.axis_y.setRange(-1.0, 1.0)
         self.show_diagnostic("")
+        self._set_follow_latest(True)
+        self._scroll_anchor_value = None
 
     # ---------------------------------------------------------------- UI
 
@@ -118,10 +215,15 @@ class OscilloscopePage(QWidget):
         self.start_button.setObjectName("oscilloscope_start_button")
         self.clear_button = QPushButton("清空波形")
         self.clear_button.setObjectName("oscilloscope_clear_button")
+        self.follow_button = QPushButton("跟随最新")
+        self.follow_button.setObjectName("oscilloscope_follow_button")
+        self.follow_button.setCheckable(True)
+        self.follow_button.setChecked(True)
         self.state_label = QLabel("未开始")
         self.state_label.setObjectName("oscilloscope_state_label")
         toolbar.addWidget(self.start_button)
         toolbar.addWidget(self.clear_button)
+        toolbar.addWidget(self.follow_button)
         toolbar.addWidget(self.state_label)
         toolbar.addStretch(1)
         root.addLayout(toolbar)
@@ -210,12 +312,98 @@ class OscilloscopePage(QWidget):
     def _connect_signals(self) -> None:
         self.start_button.clicked.connect(self._on_start_clicked)
         self.clear_button.clicked.connect(self.clear_requested.emit)
+        self.follow_button.clicked.connect(self._on_follow_clicked)
+        scrollbar = self.display_edit.verticalScrollBar()
+        scrollbar.actionTriggered.connect(self._on_display_scroll_action)
+        scrollbar.valueChanged.connect(self._on_display_scroll_changed)
 
     def _on_start_clicked(self) -> None:
         if self._receiving:
             self.stop_requested.emit()
         else:
             self.start_requested.emit()
+
+    # ------------------------------------------------------- follow latest
+
+    def _set_follow_latest(self, enabled: bool, *, scroll_to_end: bool = False) -> None:
+        self._follow_latest = bool(enabled)
+        with QSignalBlocker(self.follow_button):
+            self.follow_button.setChecked(self._follow_latest)
+        self.follow_button.setText("跟随最新" if self._follow_latest else "回到最新")
+        if scroll_to_end:
+            self._scroll_to_end()
+
+    def _on_follow_clicked(self, checked: bool) -> None:
+        self._set_follow_latest(checked, scroll_to_end=checked)
+
+    def _on_display_scroll_action(self, _action: int) -> None:
+        """记录真实用户滚动意图；程序性 ``setValue`` 不触发此信号。"""
+        self._user_scroll_pending = True
+        QTimer.singleShot(0, self._expire_user_scroll_pending)
+
+    def _expire_user_scroll_pending(self) -> None:
+        self._user_scroll_pending = False
+
+    def _on_display_scroll_changed(self, value: int) -> None:
+        if self._rendering_history or not self._user_scroll_pending:
+            return
+        self._user_scroll_pending = False
+        if value < self.display_edit.verticalScrollBar().maximum():
+            self._scroll_settle_generation += 1  # 取消待落定的程序性复位
+            self._set_follow_latest(False)
+
+    def _scroll_to_end(self) -> None:
+        scrollbar = self.display_edit.verticalScrollBar()
+        with QSignalBlocker(scrollbar):
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _apply_anchor_value(self, value: int) -> None:
+        scrollbar = self.display_edit.verticalScrollBar()
+        with QSignalBlocker(scrollbar):
+            scrollbar.setValue(max(0, min(value, scrollbar.maximum())))
+
+    def _capture_display_anchor(self) -> dict:
+        scrollbar = self.display_edit.verticalScrollBar()
+        return {
+            "value": scrollbar.value(),
+            "ratio": (
+                scrollbar.value() / scrollbar.maximum()
+                if scrollbar.maximum()
+                else 1.0
+            ),
+            "text": self.display_edit.toPlainText(),
+        }
+
+    def _restore_display_anchor(self, anchor: dict, text: str) -> None:
+        if self._follow_latest:
+            self._scroll_anchor_value = None
+            self._scroll_to_end()
+            return
+        scrollbar = self.display_edit.verticalScrollBar()
+        if text.startswith(anchor["text"]):
+            value = min(anchor["value"], scrollbar.maximum())
+        else:
+            value = (
+                round(anchor["ratio"] * scrollbar.maximum())
+                if scrollbar.maximum()
+                else 0
+            )
+        self._apply_anchor_value(value)
+        self._scroll_anchor_value = value
+
+    def _begin_scroll_settle(self) -> None:
+        """本轮事件循环结束后落定最终滚动位置，纠正 Qt 延迟布局。"""
+        self._scroll_settle_generation += 1
+        generation = self._scroll_settle_generation
+        QTimer.singleShot(0, lambda: self._finish_scroll_settle(generation))
+
+    def _finish_scroll_settle(self, generation: int) -> None:
+        if generation != self._scroll_settle_generation:
+            return
+        if self._follow_latest:
+            self._scroll_to_end()
+        elif self._scroll_anchor_value is not None:
+            self._apply_anchor_value(self._scroll_anchor_value)
 
     # ------------------------------------------------------------ channels
 
