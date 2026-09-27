@@ -230,9 +230,9 @@ def test_waveform_page_shows_single_frame_record_sample_and_channel(
     assert point.y() == pytest.approx(12.0)
     assert page.channel_labels["CH1"].text() == "CH1  12"
     text = page.display_edit.toPlainText()
-    assert "T+000.250 s" in text
-    assert 'payload="12"' in text
-    assert "解析成功" in text
+    assert text == "12", "接收正文只显示原始载荷文本"
+    assert "T+" not in text and "payload=" not in text
+    assert page.protocol_status_label.text() == ""
 
 
 # --------------------------------- 波形页接收：端口、采样、日志端到端
@@ -266,7 +266,7 @@ def test_waveform_start_receives_single_frame_into_chart_and_rx_log(qtbot, mw, t
     assert point.x() == pytest.approx(0.250)
     assert point.y() == pytest.approx(12.0)
     assert page.channel_labels["CH1"].text() == "CH1  12"
-    assert "T+000.250 s" in page.display_edit.toPlainText()
+    assert page.display_edit.toPlainText() == "12"
 
     log_path = log_service.log_dir / (
         datetime.fromtimestamp(clock.wall_ms // 1000).date().isoformat() + ".txt"
@@ -424,8 +424,9 @@ def test_invalid_complete_frame_shows_failure_logs_but_produces_no_sample(
     assert page.session.records[0].payload == b"1 2"
     assert page.session.records[0].parse_ok is False
     text = page.display_edit.toPlainText()
-    assert 'payload="1 2"' in text
-    assert "解析失败" in text
+    assert text == "1 2", "非法帧仍按原始内容显示在接收正文"
+    assert "解析失败" in page.protocol_status_label.text()
+    assert page.protocol_status_label.isVisibleTo(page)
     log_path = log_service.log_dir / (
         datetime.fromtimestamp(clock.wall_ms // 1000).date().isoformat() + ".txt"
     )

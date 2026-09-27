@@ -95,6 +95,14 @@ def rx_line(ms: int, raw_frame: bytes) -> str:
     return f"[{received:%H:%M:%S}.{ms % 1000:03d}] RX {raw_frame.hex(' ').upper()}"
 
 
+def display_text(payload: bytes) -> str:
+    """接收正文的转义规则：可打印 ASCII 原样，其余字节 ``\\xNN``。"""
+    return "".join(
+        chr(byte) if 0x20 <= byte <= 0x7E else f"\\x{byte:02X}"
+        for byte in payload
+    )
+
+
 def _make_real_controller(clock, ports=("COM7",)):
     factory = GatedFactory()
     controller = SerialController(
@@ -243,12 +251,14 @@ def test_waveform_end_to_end_protocol_matrix_display_samples_and_log(
         payload for payload, _raw in frames
     ]
     text = page.display_edit.toPlainText()
-    assert text.count("解析成功") == 2
-    assert text.count("解析失败") == len(frames) - 2
-    assert 'payload="1 2"' in text
-    assert 'payload="1\\x092"' in text  # TAB 以转义形式显示，不破坏行结构
-    assert 'payload="\\xEF\\xBC\\x91\\xEF\\xBC\\x92"' in text
-    assert "T+000.250 s" in text
+    assert text.splitlines() == [display_text(payload) for payload, _raw in frames], (
+        "接收正文逐行显示每个完整帧的原始载荷文本"
+    )
+    assert "1\\x092" in text  # TAB 以转义形式显示，不破坏行结构
+    assert "T+" not in text and "payload=" not in text
+    assert "解析失败" in page.protocol_status_label.text(), (
+        "最近一条完整帧非法时协议失败提示可见"
+    )
 
     log_path = log_service.log_dir / (
         datetime.fromtimestamp(clock.wall_ms // 1000).date().isoformat() + ".txt"

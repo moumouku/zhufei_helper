@@ -323,10 +323,8 @@ def test_data_area_renders_retained_records_and_drops_evicted_lines(qtbot):
         "250 s 的非法完整帧推进数据区窗口，0 s 和 10 s 的记录已超出 180 秒"
     )
     text = page.display_edit.toPlainText()
-    assert "T+250.000 s" in text
-    assert "T+000.000 s" not in text, "已淘汰记录不得继续显示在数据区"
-    assert "T+010.000 s" not in text
-    assert text.count("解析失败") == 1
+    assert text.splitlines() == ["bad"], "已淘汰记录不得继续显示在数据区"
+    assert "解析失败" in page.protocol_status_label.text()
 
 
 def test_page_invalid_frame_advances_display_window_but_not_sample_window(qtbot):
@@ -336,8 +334,10 @@ def test_page_invalid_frame_advances_display_window_but_not_sample_window(qtbot)
     page.consume_events([event_at_ns(240_000_000_000, b"bad")])
 
     text = page.display_edit.toPlainText()
-    assert "T+240.000 s" in text and "解析失败" in text
-    assert "T+000.000 s" not in text, "非法完整帧推进数据区 180 秒窗口"
+    assert text.splitlines() == ["bad"], (
+        "非法完整帧推进数据区 180 秒窗口，旧记录不再显示"
+    )
+    assert "解析失败" in page.protocol_status_label.text()
     assert [sample.values for sample in page.session.samples] == [(1,)], (
         "非法帧不得推进采样窗口"
     )
@@ -500,7 +500,7 @@ def test_paused_reading_position_keeps_same_record_through_prefix_eviction(qtbot
     _settle_display(page, qapp)
     paused_value = scrollbar.value()
     anchored_line = _top_display_line(page)
-    assert "T+" in anchored_line
+    assert anchored_line.isdigit(), "顶部必须停在真实记录行上"
 
     for index in range(200, 230):
         page.consume_events(

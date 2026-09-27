@@ -38,6 +38,7 @@ from .oscilloscope import (
     INT32_MAX,
     INT32_MIN,
     OscilloscopeConnectionBoundary,
+    OscilloscopeFrameRecord,
     OscilloscopeSession,
     format_connection_boundary_line,
     format_frame_line,
@@ -148,6 +149,8 @@ class OscilloscopePage(QWidget):
         self._rendering_history = False
         #: 数据区当前显示的记录；与文档区块一一对应，用于保留阅读锚点。
         self._display_records: list = []
+        #: 模型记录总数（含未进入正文的连接边界），用于增量/淘汰判定。
+        self._observed_record_count = 0
         #: “跟随最新”默认开启；用户上翻后暂停，只有点击“回到最新”才恢复。
         self._follow_latest = True
         #: 图表是否跟随最新数据；手动缩放/平移后关闭，与数据区跟随互相独立。
@@ -228,8 +231,14 @@ class OscilloscopePage(QWidget):
         self._on_resource_failed(error)
 
     def show_connection_boundary(self, settings, at_ns=None) -> None:
-        """恢复接收且参数变化时，在数据区插入连接边界记录（REQ-0005 §11.3）。"""
+        """恢复接收且参数变化时，在接收正文之外显示最新连接设置（REQ-0005 §11.3）。
+
+        模型仍保留带相对时间的连接边界记录（设置与历史可检查），但边界
+        不插入接收正文；清空/新建采集才清除该提示。
+        """
         record = self.session.note_connection_boundary(settings, at_ns)
+        self.connection_boundary_label.setText(format_connection_boundary_line(record))
+        self.connection_boundary_label.setVisible(True)
         self._sync_display([record])
 
     def consume_events(self, events) -> None:
@@ -258,6 +267,7 @@ class OscilloscopePage(QWidget):
                 record for record in new_records if record.values is not None
             ]
             self._sync_display(new_records)
+            self._update_protocol_status(new_records)
             for record in new_legal:
                 for index, value in enumerate(record.values):
                     self._ensure_channel_row(index)
@@ -401,16 +411,44 @@ class OscilloscopePage(QWidget):
         self._render_chart_guarded()
 
     def _sync_display(self, new_records) -> None:
-        """模型只追加时保留现有文本和阅读位置；发生淘汰时从模型重渲。"""
-        if self.session.record_count != len(self._display_records) + len(new_records):
+        """模型只追加时保留现有文本和阅读位置；发生淘汰时从模型重渲。
+
+        接收正文只包含完整帧；连接边界记录仍计入模型总数，但不占正文行。
+        """
+        if self.session.record_count != self._observed_record_count + len(new_records):
             self._render_history()
             return
         for record in new_records:
-            self.display_edit.appendPlainText(self._format_record(record))
-        self._display_records.extend(new_records)
+            if isinstance(record, OscilloscopeConnectionBoundary):
+                continue
+            self._append_display_line(self._format_record(record))
+            self._display_records.append(record)
+        self._observed_record_count = self.session.record_count
         if self._follow_latest:
             self._scroll_to_end()
             self._begin_scroll_settle()
+
+    def _append_display_line(self, text: str) -> None:
+        """追加一个显示记录块；空载荷也必须占一行，保持区块与记录一一对应。"""
+        edit = self.display_edit
+        cursor = QTextCursor(edit.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if self._display_records:
+            cursor.insertBlock()
+        cursor.insertText(text)
+
+    def _update_protocol_status(self, new_records) -> None:
+        """协议状态只反映最近一条完整帧，不受接收正文的逐行文本影响。"""
+        if not new_records:
+            return
+        last = new_records[-1]
+        if isinstance(last, OscilloscopeFrameRecord):
+            self._set_protocol_failure(not last.parse_ok)
+
+    def _set_protocol_failure(self, failed: bool) -> None:
+        text = "协议解析失败：最近完整帧未生成波形" if failed else ""
+        self.protocol_status_label.setText(text)
+        self.protocol_status_label.setVisible(bool(text))
 
     def _sync_view_for_data(self) -> None:
         """新数据后的 X 视口：跟随则适配/滑动保留范围，手动则夹紧不越界。"""
@@ -531,22 +569,27 @@ class OscilloscopePage(QWidget):
         self.history_hint_label.setVisible(bool(visible))
 
     def _render_history(self) -> None:
-        """从模型当前保留的记录重渲数据区（记录淘汰或清空后调用）。
+        """从模型当前保留的完整帧重渲接收正文（记录淘汰或清空后调用）。
 
-        重渲尊重跟随状态：跟随开启滚动到末尾；暂停时按记录身份把同一条
-        保留记录保持在视口顶部（锚定记录已淘汰时退到最早保留记录），
-        数据继续进入模型和文本但不强制移动视口。
+        连接边界记录不进入正文，只更新模型计数；重渲尊重跟随状态：跟随
+        开启滚动到末尾；暂停时按记录身份把同一条保留记录保持在视口顶部
+        （锚定记录已淘汰时退到最早保留记录），数据继续进入模型和文本但
+        不强制移动视口。
         """
         if self._rendering_history:
             return
         anchor = self._capture_display_anchor()
         self._rendering_history = True
         try:
-            text = "\n".join(
-                self._format_record(record) for record in self.session.records
-            )
+            frames = [
+                record
+                for record in self.session.records
+                if not isinstance(record, OscilloscopeConnectionBoundary)
+            ]
+            text = "\n".join(self._format_record(record) for record in frames)
             self.display_edit.setPlainText(text)
-            self._display_records = self.session.records
+            self._display_records = frames
+            self._observed_record_count = self.session.record_count
             self._restore_display_anchor(anchor, text)
             self._begin_scroll_settle()
         finally:
@@ -554,8 +597,6 @@ class OscilloscopePage(QWidget):
 
     @staticmethod
     def _format_record(record) -> str:
-        if isinstance(record, OscilloscopeConnectionBoundary):
-            return format_connection_boundary_line(record)
         return format_frame_line(record)
 
     def clear_acquisition(self, origin_ns: int | None = None) -> None:
@@ -568,6 +609,7 @@ class OscilloscopePage(QWidget):
         was_receiving = self._receiving
         self.session.reset()
         self._display_records = []
+        self._observed_record_count = 0
         # 显式新建采集才解除绘图资源失败状态；清理资源诊断与旧悬停读值。
         self._resource_failed = False
         if origin_ns is not None:
@@ -579,6 +621,9 @@ class OscilloscopePage(QWidget):
         self.axis_x.setRange(DEFAULT_X_MIN, DEFAULT_X_MAX)
         self.axis_y.setRange(DEFAULT_Y_MIN, DEFAULT_Y_MAX)
         self.show_diagnostic("")
+        self._set_protocol_failure(False)
+        self.connection_boundary_label.clear()
+        self.connection_boundary_label.setVisible(False)
         self._set_follow_latest(True)
         self._chart_following = True
         self._manual_x_span = None
@@ -651,6 +696,24 @@ class OscilloscopePage(QWidget):
         self.diagnostic_label.setWordWrap(True)
         self.diagnostic_label.setVisible(False)
         root.addWidget(self.diagnostic_label)
+
+        self.protocol_status_label = QLabel("")
+        self.protocol_status_label.setObjectName("oscilloscope_protocol_status_label")
+        self.protocol_status_label.setStyleSheet(f"color: {COLORS['warning']};")
+        self.protocol_status_label.setTextFormat(Qt.PlainText)
+        self.protocol_status_label.setWordWrap(True)
+        self.protocol_status_label.setVisible(False)
+        root.addWidget(self.protocol_status_label)
+
+        self.connection_boundary_label = QLabel("")
+        self.connection_boundary_label.setObjectName(
+            "oscilloscope_connection_boundary_label"
+        )
+        self.connection_boundary_label.setStyleSheet(f"color: {COLORS['secondary']};")
+        self.connection_boundary_label.setTextFormat(Qt.PlainText)
+        self.connection_boundary_label.setWordWrap(True)
+        self.connection_boundary_label.setVisible(False)
+        root.addWidget(self.connection_boundary_label)
 
         self.log_error_label = QLabel("")
         self.log_error_label.setObjectName("oscilloscope_log_error_label")

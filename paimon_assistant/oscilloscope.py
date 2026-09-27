@@ -533,27 +533,24 @@ def format_sample_value(value: float) -> str:
 
 
 def format_payload(payload: bytes) -> str:
-    """Display payload bytes without changing them or breaking the line."""
-    text = "".join(
+    """Display payload bytes without changing them or breaking the line.
+
+    Printable ASCII is kept verbatim (including quotes and backslashes);
+    non-printable bytes fall back to the existing ``\\xNN`` spelling so a
+    malformed byte stays inspectable instead of splitting the frame.
+    """
+    return "".join(
         chr(byte) if 0x20 <= byte <= 0x7E else f"\\x{byte:02X}" for byte in payload
     )
-    return f'"{text}"'
 
 
 def format_connection_boundary_line(record: OscilloscopeConnectionBoundary) -> str:
-    """One data-area boundary line: relative time plus every serial setting."""
+    """Compact boundary notice: current settings, no relative timestamp."""
     settings = record.settings
     serial_format = f"{settings.data_bits}{settings.parity}{settings.stop_bits:g}"
-    return (
-        f"{format_relative_seconds(record.relative_seconds)}  "
-        f"── 连接边界 {settings.port} · {settings.baudrate} · {serial_format}"
-    )
+    return f"连接边界：{settings.port} · {settings.baudrate} · {serial_format}"
 
 
 def format_frame_line(record: OscilloscopeFrameRecord) -> str:
-    """One data-area line: relative time, raw payload and parse status."""
-    status = "解析成功" if record.parse_ok else "解析失败"
-    return (
-        f"{format_relative_seconds(record.relative_seconds)}  "
-        f"payload={format_payload(record.payload)}  {status}"
-    )
+    """One receive-area line: exactly the received payload text."""
+    return format_payload(record.payload)

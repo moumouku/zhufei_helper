@@ -498,7 +498,7 @@ def test_programmatic_clear_on_data_page_keeps_waveform_history(qtbot, mw, tmp_p
     window._on_waveform_clear_clicked()  # 数据页当前：不得清空波形历史
 
     assert [sample.values for sample in page.session.samples] == [(12,)]
-    assert "T+000.250 s" in page.display_edit.toPlainText()
+    assert page.display_edit.toPlainText() == "12"
     window.close()
 
 
@@ -1208,12 +1208,12 @@ def test_connection_boundary_records_relative_time_and_full_settings():
     assert record.relative_seconds == pytest.approx(4.0)
     assert record.settings is settings
     assert session.records == [record]
-    line = format_connection_boundary_line(record)
-    assert "T+004.000 s" in line
-    assert "连接边界" in line
-    assert "COM4" in line
-    assert "460800" in line
-    assert "7E2" in line
+    label = format_connection_boundary_line(record)
+    assert "T+" not in label, "连接边界提示不得显示相对时间"
+    assert "连接边界" in label
+    assert "COM4" in label
+    assert "460800" in label
+    assert "7E2" in label
 
 
 # -------------------------------------------- 停止/恢复与重连边界
@@ -1313,8 +1313,12 @@ def test_waveform_resume_with_changed_settings_inserts_connection_boundary(
     assert boundary.settings.baudrate == 9600
     assert (boundary.settings.data_bits, boundary.settings.parity) == (8, "N")
     assert boundary.settings.stop_bits == 1
-    assert "连接边界" in page.display_edit.toPlainText()
-    assert "COM7" in page.display_edit.toPlainText()
+    assert "连接边界" not in page.display_edit.toPlainText(), (
+        "机器生成的连接边界不得进入接收正文"
+    )
+    assert "连接边界" in page.connection_boundary_label.text()
+    assert "COM7" in page.connection_boundary_label.text()
+    assert "T+" not in page.connection_boundary_label.text()
 
     # 历史、原点与通道保留；新帧继续按原原点计时。
     assert page.session.origin_ns == 1_000_000_000

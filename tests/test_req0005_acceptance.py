@@ -261,7 +261,7 @@ def test_storage_failure_keeps_committed_history_unlocks_and_leaks_nothing(
     assert not page.is_receiving
     assert window.page_tabs.tabBar().isEnabled(), "存储资源失败必须解除切页锁"
     assert "资源" in page.diagnostic_label.text()
-    assert "T+000.100 s" in page.display_edit.toPlainText(), "已提交帧仍可见"
+    assert page.display_edit.toPlainText() == "12", "已提交帧仍可见"
 
     # 已 drain 的剩余帧与旧队列数据都不得泄漏进数据页，也不得二次补收。
     assert window._event_history == []
@@ -597,10 +597,14 @@ def test_real_controller_waveform_sequence_samples_records_and_rx_log(
     deliver(serial, clock, b"12,-34\r\n", monotonic_ns=1_250_000_000, wall_ms=1_700_000_000_250)
     assert wait_until(lambda: controller.received_queue.qsize() >= 1)
     window._drain_queues()
+    assert page.display_edit.toPlainText().splitlines() == ["12,-34"]
+    assert page.protocol_status_label.text() == ""
 
     deliver(serial, clock, b"1 2\r\n", monotonic_ns=1_500_000_000, wall_ms=1_700_000_000_500)
     assert wait_until(lambda: controller.received_queue.qsize() >= 1)
     window._drain_queues()
+    assert page.display_edit.toPlainText().splitlines() == ["12,-34", "1 2"]
+    assert "解析失败" in page.protocol_status_label.text()
 
     deliver(serial, clock, b"56\r\n", monotonic_ns=2_000_000_000, wall_ms=1_700_000_001_000)
     assert wait_until(lambda: controller.received_queue.qsize() >= 1)
@@ -619,8 +623,13 @@ def test_real_controller_waveform_sequence_samples_records_and_rx_log(
     assert page.session.channel_count == 2
     assert page.session.channel_latest_value(1) == -34
     text = page.display_edit.toPlainText()
-    assert "T+000.250 s" in text and "T+000.500 s" in text and "T+001.000 s" in text
-    assert 'payload="12,-34"' in text and "解析失败" in text
+    assert text.splitlines() == ["12,-34", "1 2", "56"], (
+        "接收正文逐行保留合法与非法完整帧的原始内容"
+    )
+    assert "T+" not in text and "payload=" not in text
+    assert page.protocol_status_label.text() == "", (
+        "最新完整帧合法时只清除先前的协议失败提示"
+    )
     assert page.ch1_series.count() == 2
 
     assert log_lines(log_service) == [
@@ -725,7 +734,7 @@ def test_log_failure_keeps_multiple_frames_sampling_rendering_and_one_notice(
     )
     assert page.ch1_series.count() == 3, "日志故障不得停止图表更新"
     text = page.display_edit.toPlainText()
-    assert "T+000.100 s" in text and "T+000.200 s" in text and "T+000.300 s" in text
+    assert text.splitlines() == ["1", "2", "3"]
     assert log_service.failed
     assert opener.calls == 1, "熔断后不得重试文件系统"
     fixed = "日志写入失败，请检查磁盘空间或权限"
