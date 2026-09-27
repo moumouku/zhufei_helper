@@ -501,6 +501,35 @@ def test_clear_hides_hover_readout(qtbot):
     assert page.hover_label.text() == ""
 
 
+def test_hover_queries_candidate_band_without_materializing_all_samples(
+    qtbot, qapp, monkeypatch
+):
+    """悬停只查询指针附近时间带，不得为全量 180 秒保留点建列表。"""
+    page, clock = make_page(qtbot)
+    show_page(qtbot, page)
+    page.consume_events(
+        [
+            frame(clock, 0, b"1"),
+            frame(clock, 500_000_000, b"2"),
+            frame(clock, 1_000_000_000, b"3"),
+        ]
+    )
+    page.set_view_range(0.0, 1.25, y_min=0.0, y_max=10.0)
+    point = viewport_point_of(page, 0.5, 2.0)
+
+    def fail_materialize(_session):
+        raise AssertionError("悬停不得构造 session.samples 全量列表")
+
+    monkeypatch.setattr(
+        OscilloscopeSession, "samples", property(fail_materialize)
+    )
+
+    move_mouse(page, point)
+
+    assert page.hover_label.isVisible(), "候选带内的真实采样必须可悬停"
+    assert "CH1=2" in page.hover_label.text()
+
+
 def test_hover_ignores_disabled_channels_and_hides_when_none_enabled(qtbot):
     page, clock = make_page(qtbot)
     show_page(qtbot, page)

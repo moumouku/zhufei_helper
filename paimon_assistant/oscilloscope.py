@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import time
 from array import array
+from bisect import bisect_left, bisect_right
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Iterable, List, Optional, Union
@@ -49,7 +50,9 @@ class CompactSampleStore:
 
     - ``times``：每条采样的共同相对时间（``array('d')``，8 字节/点）；
     - ``widths``：该帧实际字段数 1～8（``array('B')``，1 字节/点）；
-    - ``values``：按帧顺序拉平的实际字段值（``array('i')``，4 字节/值）。
+    - ``values``：按帧顺序拉平的实际字段值（``array('i')``，4 字节/值）；
+    - ``offsets``：每条采样在 ``values`` 中的起始下标（``array('I')``，4 字节/点），
+      使按时间二分的区间查询无需从头累计前面所有帧的宽度。
 
     缺口由 ``widths`` 与拉平的值直接重建，不再保存每通道逐点元组，也不再
     保存逐点样本对象。淘汰只推进起始偏移，按摊还批量物理丢弃前缀，因此
@@ -64,6 +67,7 @@ class CompactSampleStore:
         self.times = array("d")
         self.widths = array("B")
         self.values = array("i")
+        self.offsets = array("I")
         #: 物理数组中第一条保留采样的下标；``base`` 是它的绝对序号。
         self.start = 0
         self.values_start = 0
@@ -98,6 +102,26 @@ class CompactSampleStore:
             )
             running += width
 
+    def iter_samples_in_range(
+        self, x_min: float, x_max: float
+    ) -> Iterable[tuple[float, tuple[int, ...]]]:
+        """产出相对时间落在闭区间 ``[x_min, x_max]`` 的保留采样。
+
+        时间数组按追加顺序单调；二分定位第一条不早于 ``x_min`` 的采样，
+        再顺序读到超过 ``x_max``。每帧的值区间由 ``offsets`` 直接定位，
+        不扫描区间之前的采样，也不构造全量样本列表。
+        """
+        start = self.start
+        count = self.count
+        if count == 0 or x_max < x_min:
+            return
+        first = bisect_left(self.times, x_min, start, start + count)
+        last = bisect_right(self.times, x_max, first, start + count)
+        for position in range(first, last):
+            offset = self.offsets[position]
+            width = self.widths[position]
+            yield self.times[position], tuple(self.values[offset : offset + width])
+
     def iter_channel_points(self, index: int) -> Iterable[tuple[int, float, int]]:
         """产出实际提供通道 ``index`` 的 ``(位置, 相对时间, 值)``。
 
@@ -117,13 +141,16 @@ class CompactSampleStore:
         times_len = len(self.times)
         widths_len = len(self.widths)
         values_len = len(self.values)
+        offsets_len = len(self.offsets)
         try:
             self.times.append(relative_seconds)
             self.widths.append(len(values))
+            self.offsets.append(values_len)
             self._append_values(values)
         except BaseException:
             del self.times[times_len:]
             del self.widths[widths_len:]
+            del self.offsets[offsets_len:]
             del self.values[values_len:]
             raise
 
@@ -132,6 +159,7 @@ class CompactSampleStore:
         width = self.widths[-1]
         del self.times[-1:]
         del self.widths[-1:]
+        del self.offsets[-1:]
         del self.values[len(self.values) - width :]
 
     def evict_oldest(self) -> None:
@@ -140,9 +168,14 @@ class CompactSampleStore:
         self.start += 1
         self.base += 1
         if self.start >= _COMPACT_MIN_PREFIX and self.start >= self.count:
+            removed_values = self.values_start
             del self.times[: self.start]
             del self.widths[: self.start]
-            del self.values[: self.values_start]
+            del self.offsets[: self.start]
+            del self.values[:removed_values]
+            # 偏移量是扁平数组的绝对下标：物理删除前缀后整体前移。
+            for index in range(len(self.offsets)):
+                self.offsets[index] -= removed_values
             self.start = 0
             self.values_start = 0
 
@@ -150,6 +183,7 @@ class CompactSampleStore:
         del self.times[:]
         del self.widths[:]
         del self.values[:]
+        del self.offsets[:]
         self.start = 0
         self.values_start = 0
         self.base = 0
@@ -300,6 +334,19 @@ class OscilloscopeSession:
             OscilloscopeSample(relative_seconds, values)
             for relative_seconds, values in self._store.iter_samples()
         ]
+
+    def iter_samples_in_range(
+        self, x_min: float, x_max: float
+    ) -> Iterable[OscilloscopeSample]:
+        """当前保留采样中相对时间落在闭区间 ``[x_min, x_max]`` 的原始帧。
+
+        悬停只检查指针附近的时间带；此查询按紧凑时间数组二分定位，避免
+        为全量保留点构造 ``OscilloscopeSample`` 列表（REQ-0005 §8.4）。
+        """
+        for relative_seconds, values in self._store.iter_samples_in_range(
+            x_min, x_max
+        ):
+            yield OscilloscopeSample(relative_seconds, values)
 
     @property
     def sample_count(self) -> int:

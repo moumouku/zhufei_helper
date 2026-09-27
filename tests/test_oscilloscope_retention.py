@@ -12,12 +12,15 @@ import sys
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QPoint
+from PySide6.QtGui import QTextCursor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from paimon_assistant.oscilloscope import (  # noqa: E402
     OscilloscopeConnectionBoundary,
+    OscilloscopeSample,
     OscilloscopeSession,
 )
 from paimon_assistant.oscilloscope_page import OscilloscopePage  # noqa: E402
@@ -58,6 +61,81 @@ def make_page(qtbot) -> tuple[OscilloscopePage, StepClock]:
     qtbot.addWidget(page)
     page.begin_acquisition()
     return page, clock
+
+
+# ---------------------------- 时间区间查询：悬停候选帧的窄扫描
+
+
+def test_iter_samples_in_range_returns_exact_frames_inside_inclusive_bounds():
+    clock = StepClock()
+    session = make_session(clock)
+    frame_at_ns(session, clock, 0, b"1,2")
+    frame_at_ns(session, clock, 10_000_000_000, b"3")
+    frame_at_ns(session, clock, 20_000_000_000, b"4,5,6")
+
+    inside = list(session.iter_samples_in_range(10.0, 20.0))
+    assert inside == [
+        OscilloscopeSample(10.0, (3,)),
+        OscilloscopeSample(20.0, (4, 5, 6)),
+    ], "闭区间查询必须返回真实完整帧（含全部通道值），两端边界都包含"
+
+    assert list(session.iter_samples_in_range(10.5, 19.999)) == [], (
+        "区间内没有真实采样时不得生成伪值"
+    )
+    assert list(session.iter_samples_in_range(20.0, 10.0)) == [], (
+        "反向区间必须为空而不是反向扫描"
+    )
+    assert list(session.iter_samples_in_range(-1.0, 0.0)) == [
+        OscilloscopeSample(0.0, (1, 2))
+    ]
+
+
+def test_iter_samples_in_range_matches_retained_samples_after_eviction():
+    clock = StepClock()
+    session = make_session(clock)
+    for index in range(260):
+        frame_at_ns(session, clock, index * 1_000_000_000, str(index).encode())
+
+    samples = session.samples
+    assert samples[0].relative_seconds == pytest.approx(79.0)
+    assert samples[-1].relative_seconds == pytest.approx(259.0)
+
+    queried = list(session.iter_samples_in_range(200.0, 205.0))
+    assert queried == [
+        sample for sample in samples if 200.0 <= sample.relative_seconds <= 205.0
+    ], "淘汰前缀后的区间查询必须与全量保留列表的切片一致"
+    assert queried[-1].values == (205,)
+
+
+def test_iter_samples_in_range_on_full_180k_window_returns_latest_real_frames():
+    """满窗 180001 个 1 kHz 原始点时，末尾区间查询仍返回真实完整帧。"""
+    clock = StepClock()
+    session = make_session(clock)
+    for index in range(180_001):
+        frame_at_ns(session, clock, index * 1_000_000, str(index).encode())
+    assert session.sample_count == 180_001
+
+    queried = list(session.iter_samples_in_range(179.995, 180.0))
+    assert queried == session.samples[-6:], (
+        "满窗末尾查询必须与保留列表切片逐帧一致"
+    )
+    assert queried[-1].values == (180_000,)
+
+
+def test_iter_samples_in_range_matches_physical_prefix_compaction_window():
+    """32 Hz 长跑后物理丢弃已淘汰前缀，偏移量必须随数组一起前移。"""
+    clock = StepClock()
+    session = make_session(clock)
+    period_ns = 31_250_000
+    for index in range(16_001):
+        frame_at_ns(session, clock, index * period_ns, str(index).encode())
+
+    expected = [
+        sample for sample in session.samples if sample.relative_seconds >= 179.0
+    ]
+    queried = list(session.iter_samples_in_range(179.0, 500.0))
+    assert queried == expected, "物理压缩后区间查询仍必须指向正确的扁平值区间"
+    assert queried[-1].values == (16_000,)
 
 
 # ------------------------------------------- 采样窗口：按最新合法采样推进
@@ -363,6 +441,135 @@ def test_return_to_latest_restores_follow_for_subsequent_frames(qtbot):
 
     qtbot.waitUntil(lambda: scrollbar.value() == scrollbar.maximum())
     assert "latest-line" in page.display_edit.toPlainText()
+
+
+def test_follow_stays_at_end_when_rolling_eviction_layout_settles_late(qtbot, qapp):
+    """跟随最新必须在淘汰重渲后的延迟布局/滚动范围更新后仍贴底。
+
+    页面隐藏或布局落后时，``setPlainText`` 会把滚动位置重置为 0，而一次性
+    的落定回调可能早于 Qt 最终的 ``rangeChanged``；这里按一帧一次事件循环
+    量把 200 帧推过 180 秒滚动淘汰，再显示并让布局落定，验证跟随态不回退。
+    """
+    page, _clock = make_page(qtbot)
+    page.resize(400, 200)
+    for index in range(200):
+        page.consume_events(
+            [event_at_ns(index * 1_000_000_000, str(index).encode())]
+        )
+        qapp.processEvents()
+
+    page.show()
+    scrollbar = page.display_edit.verticalScrollBar()
+    qtbot.waitUntil(lambda: scrollbar.maximum() > 150)
+    for _ in range(5):
+        qapp.processEvents()
+
+    assert page.follow_button.isChecked()
+    assert scrollbar.value() == scrollbar.maximum(), (
+        "淘汰重渲后的延迟布局不得让跟随态停在文档顶部"
+    )
+
+    # 落定后继续接收的新帧仍必须保持贴底。
+    for index in range(200, 205):
+        page.consume_events(
+            [event_at_ns(index * 1_000_000_000, str(index).encode())]
+        )
+        qapp.processEvents()
+    assert scrollbar.value() == scrollbar.maximum(), "后续新帧必须继续贴底"
+
+
+def test_paused_reading_position_keeps_same_record_through_prefix_eviction(qtbot, qapp):
+    """暂停阅读位置在 180 秒前缀淘汰后必须仍停在同一条保留记录上。
+
+    按一帧一次事件循环量推过淘汰：旧实现按 ``value/max`` 比例恢复，
+    运行中 Windows 会把位置逐步拉向 0，阅读内容持续向前漂移。
+    """
+    page, _clock = make_page(qtbot)
+    page.resize(400, 200)
+    page.show()
+    for index in range(200):
+        page.consume_events(
+            [event_at_ns(index * 1_000_000_000, str(index).encode())]
+        )
+        qapp.processEvents()
+
+    scrollbar = page.display_edit.verticalScrollBar()
+    qtbot.waitUntil(lambda: scrollbar.maximum() > 150)
+    scrollbar.setSliderPosition(scrollbar.maximum() // 2)
+    qtbot.waitUntil(lambda: not page.follow_button.isChecked())
+    _settle_display(page, qapp)
+    paused_value = scrollbar.value()
+    anchored_line = _top_display_line(page)
+    assert "T+" in anchored_line
+
+    for index in range(200, 230):
+        page.consume_events(
+            [event_at_ns(index * 1_000_000_000, str(index).encode())]
+        )
+        qapp.processEvents()
+    _settle_display(page, qapp)
+
+    assert page.session.record_count == 181, "测试前提：前缀记录已被 180 秒窗口淘汰"
+    assert not page.follow_button.isChecked(), "新帧不得恢复已暂停的阅读状态"
+    assert _top_display_line(page) == anchored_line, (
+        "前缀淘汰后顶部必须仍是同一条保留记录，而不是比例跳到更晚内容"
+    )
+    assert scrollbar.value() < paused_value, "内容保持不动时阅读位置应随淘汰上移"
+
+
+def test_paused_selection_keeps_same_retained_text_through_prefix_eviction(qtbot, qapp):
+    """重渲后用户选区仍覆盖同一段保留内容，不得被清空或错位到伪内容。"""
+    page, _clock = make_page(qtbot)
+    page.resize(400, 200)
+    page.show()
+    for index in range(200):
+        page.consume_events(
+            [event_at_ns(index * 1_000_000_000, str(index).encode())]
+        )
+        qapp.processEvents()
+
+    scrollbar = page.display_edit.verticalScrollBar()
+    qtbot.waitUntil(lambda: scrollbar.maximum() > 150)
+    scrollbar.setSliderPosition(scrollbar.maximum() // 2)
+    qtbot.waitUntil(lambda: not page.follow_button.isChecked())
+    _settle_display(page, qapp)
+
+    document = page.display_edit.document()
+    top = page.display_edit.cursorForPosition(QPoint(0, 0)).blockNumber()
+    start = document.findBlockByNumber(top).position()
+    end = document.findBlockByNumber(top + 1).position() + 5
+    selection = QTextCursor(document)
+    selection.setPosition(start)
+    selection.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+    page.display_edit.setTextCursor(selection)
+    selected_text = page.display_edit.textCursor().selectedText()
+    assert selected_text, "测试前提：已选中一段可见保留内容"
+
+    for index in range(200, 215):
+        page.consume_events(
+            [event_at_ns(index * 1_000_000_000, str(index).encode())]
+        )
+        qapp.processEvents()
+    _settle_display(page, qapp)
+
+    restored = page.display_edit.textCursor()
+    assert restored.hasSelection(), "两端记录仍保留时选区必须保留"
+    assert restored.selectedText() == selected_text, (
+        "重渲后选区必须仍选中同一段保留内容"
+    )
+
+
+def _settle_display(page: OscilloscopePage, qapp) -> None:
+    """让 Qt 延迟布局与重绘落定，保证 cursorForPosition 读数稳定。"""
+    for _ in range(6):
+        page.display_edit.viewport().repaint()
+        qapp.processEvents()
+
+
+def _top_display_line(page: OscilloscopePage) -> str:
+    """视口顶部可见记录行；每个记录恰好是一个文档区块。"""
+    block = page.display_edit.cursorForPosition(QPoint(0, 0)).blockNumber()
+    return page.display_edit.document().findBlockByNumber(block).text()
 
 
 def test_stop_does_not_evict_history_and_resume_advances_both_windows(qtbot):

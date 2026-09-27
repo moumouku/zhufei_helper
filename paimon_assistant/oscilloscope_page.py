@@ -22,7 +22,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -145,8 +145,8 @@ class OscilloscopePage(QWidget):
         self.session = session
         self._receiving = False
         self._rendering_history = False
-        #: 页面已送入数据区的模型记录数；用于检测模型是否淘汰了旧记录。
-        self._records_rendered = 0
+        #: 数据区当前显示的记录；与文档区块一一对应，用于保留阅读锚点。
+        self._display_records: list = []
         #: “跟随最新”默认开启；用户上翻后暂停，只有点击“回到最新”才恢复。
         self._follow_latest = True
         #: 图表是否跟随最新数据；手动缩放/平移后关闭，与数据区跟随互相独立。
@@ -167,7 +167,7 @@ class OscilloscopePage(QWidget):
         )
         self._user_scroll_pending = False
         self._scroll_settle_generation = 0
-        self._scroll_anchor_value = None
+        self._scroll_anchor_block: int | None = None
         self._chart_rerender_pending = False
         self._build_ui()
         self._connect_signals()
@@ -401,12 +401,12 @@ class OscilloscopePage(QWidget):
 
     def _sync_display(self, new_records) -> None:
         """模型只追加时保留现有文本和阅读位置；发生淘汰时从模型重渲。"""
-        if self.session.record_count != self._records_rendered + len(new_records):
+        if self.session.record_count != len(self._display_records) + len(new_records):
             self._render_history()
             return
         for record in new_records:
             self.display_edit.appendPlainText(self._format_record(record))
-        self._records_rendered += len(new_records)
+        self._display_records.extend(new_records)
         if self._follow_latest:
             self._scroll_to_end()
             self._begin_scroll_settle()
@@ -532,8 +532,9 @@ class OscilloscopePage(QWidget):
     def _render_history(self) -> None:
         """从模型当前保留的记录重渲数据区（记录淘汰或清空后调用）。
 
-        重渲尊重跟随状态：跟随开启滚动到末尾；暂停时按旧文本前缀或比例
-        保留阅读位置，数据继续进入模型和文本但不强制移动视口。
+        重渲尊重跟随状态：跟随开启滚动到末尾；暂停时按记录身份把同一条
+        保留记录保持在视口顶部（锚定记录已淘汰时退到最早保留记录），
+        数据继续进入模型和文本但不强制移动视口。
         """
         if self._rendering_history:
             return
@@ -544,7 +545,7 @@ class OscilloscopePage(QWidget):
                 self._format_record(record) for record in self.session.records
             )
             self.display_edit.setPlainText(text)
-            self._records_rendered = self.session.record_count
+            self._display_records = self.session.records
             self._restore_display_anchor(anchor, text)
             self._begin_scroll_settle()
         finally:
@@ -565,7 +566,7 @@ class OscilloscopePage(QWidget):
         """
         was_receiving = self._receiving
         self.session.reset()
-        self._records_rendered = 0
+        self._display_records = []
         # 显式新建采集才解除绘图资源失败状态；清理资源诊断与旧悬停读值。
         self._resource_failed = False
         if origin_ns is not None:
@@ -582,7 +583,7 @@ class OscilloscopePage(QWidget):
         self._manual_x_span = None
         self._initial_y_pending = True
         self._set_history_hint(False)
-        self._scroll_anchor_value = None
+        self._scroll_anchor_block = None
         # 使清空前排队的滚动/图表落定失效，避免旧锚点重新定位新采集。
         self._scroll_settle_generation += 1
         self._user_scroll_pending = False
@@ -760,6 +761,7 @@ class OscilloscopePage(QWidget):
         scrollbar = self.display_edit.verticalScrollBar()
         scrollbar.actionTriggered.connect(self._on_display_scroll_action)
         scrollbar.valueChanged.connect(self._on_display_scroll_changed)
+        scrollbar.rangeChanged.connect(self._on_display_range_changed)
 
     def _on_start_clicked(self) -> None:
         if self._receiving:
@@ -771,6 +773,7 @@ class OscilloscopePage(QWidget):
 
     def _set_follow_latest(self, enabled: bool, *, scroll_to_end: bool = False) -> None:
         self._follow_latest = bool(enabled)
+        self._scroll_anchor_block = None
         with QSignalBlocker(self.follow_button):
             self.follow_button.setChecked(self._follow_latest)
         self.follow_button.setText("跟随最新" if self._follow_latest else "回到最新")
@@ -781,7 +784,7 @@ class OscilloscopePage(QWidget):
         self._set_follow_latest(checked, scroll_to_end=checked)
 
     def _on_display_scroll_action(self, _action: int) -> None:
-        """记录真实用户滚动意图；程序性 ``setValue`` 不触发此信号。"""
+        """记录真实用户滚动意图；``setValue`` 等程序性滚动不触发此动作信号。"""
         self._user_scroll_pending = True
         QTimer.singleShot(0, self._expire_user_scroll_pending)
 
@@ -789,51 +792,176 @@ class OscilloscopePage(QWidget):
         self._user_scroll_pending = False
 
     def _on_display_scroll_changed(self, value: int) -> None:
+        """用户滚动离开末尾时暂停跟随；中途的程序性滚动不得提前消费意图。"""
         if self._rendering_history or not self._user_scroll_pending:
             return
-        self._user_scroll_pending = False
         if value < self.display_edit.verticalScrollBar().maximum():
-            self._scroll_settle_generation += 1  # 取消待落定的程序性复位
+            self._user_scroll_pending = False
+            self._scroll_settle_generation += 1
             self._set_follow_latest(False)
 
+    def _on_display_range_changed(self, _minimum: int, _maximum: int) -> None:
+        """Qt 延迟布局更新滚动范围后安排一次落定。
+
+        不能在 ``rangeChanged`` 信号内直接驱动 QTextCursor/布局（Qt 在文档
+        布局回调中重入会破坏内部状态），这里仅重置待落定回调；每次范围
+        变化都会重新安排，因此最终落定一定在最后一次布局之后。
+        """
+        if self._rendering_history or self._user_scroll_pending:
+            return
+        if self._follow_latest or self._scroll_anchor_block is not None:
+            self._begin_scroll_settle()
+
     def _scroll_to_end(self) -> None:
-        scrollbar = self.display_edit.verticalScrollBar()
-        with QSignalBlocker(scrollbar):
-            scrollbar.setValue(scrollbar.maximum())
+        """跟随态贴底：光标移到文档末尾，再把滚动条设到最大值。
+
+        只设滚动条值会被 Qt 之后的延迟布局重置；光标是真实的文档位置，
+        先固定住视图状态。用户已有选区随后原样恢复，跟随接收不误清选择。
+        """
+        edit = self.display_edit
+        scrollbar = edit.verticalScrollBar()
+        previous = edit.textCursor()
+        cursor = QTextCursor(edit.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        edit.setTextCursor(cursor)
+        self._apply_anchor_value(scrollbar.maximum())
+        if previous.hasSelection():
+            edit.setTextCursor(previous)
+            self._apply_anchor_value(scrollbar.maximum())
 
     def _apply_anchor_value(self, value: int) -> None:
+        """程序性设置滚动位置；不屏蔽 valueChanged。
+
+        Qt 自身需要 valueChanged 同步视图状态；屏蔽后在下一次布局
+        会把位置“纠正”回去。用户滚动意图由 ``actionTriggered`` 单独识别，
+        程序性 setValue 不会触发该动作信号。
+        """
         scrollbar = self.display_edit.verticalScrollBar()
-        with QSignalBlocker(scrollbar):
-            scrollbar.setValue(max(0, min(value, scrollbar.maximum())))
+        scrollbar.setValue(max(0, min(value, scrollbar.maximum())))
 
     def _capture_display_anchor(self) -> dict:
+        """捕获暂停阅读锚点：顶部可见记录、滚动值与当前选区。"""
         scrollbar = self.display_edit.verticalScrollBar()
         return {
             "value": scrollbar.value(),
-            "ratio": (
-                scrollbar.value() / scrollbar.maximum()
-                if scrollbar.maximum()
-                else 1.0
-            ),
             "text": self.display_edit.toPlainText(),
+            "record": self._top_display_record(),
+            "selection": self._capture_display_selection(),
         }
+
+    def _top_display_record(self):
+        """视口顶部可见的模型记录；文档区块与记录一一对应。"""
+        if not self._display_records:
+            return None
+        block = self.display_edit.cursorForPosition(QPoint(0, 0)).blockNumber()
+        if 0 <= block < len(self._display_records):
+            return self._display_records[block]
+        return None
+
+    def _record_block_number(self, record) -> int | None:
+        """记录在当前数据区中的区块号；已被 180 秒窗口淘汰时返回 ``None``。"""
+        if record is None:
+            return None
+        for index, candidate in enumerate(self._display_records):
+            if candidate is record:
+                return index
+        return None
+
+    def _capture_display_selection(self) -> dict | None:
+        """捕获选区两端所在的记录与行内偏移，供重渲后按保留内容还原。"""
+        cursor = self.display_edit.textCursor()
+        if not cursor.hasSelection() or not self._display_records:
+            return None
+        document = self.display_edit.document()
+        start_block = document.findBlock(cursor.selectionStart())
+        end_block = document.findBlock(cursor.selectionEnd())
+        start_index = start_block.blockNumber()
+        end_index = end_block.blockNumber()
+        if not 0 <= start_index < len(self._display_records):
+            return None
+        if not 0 <= end_index < len(self._display_records):
+            return None
+        return {
+            "start_record": self._display_records[start_index],
+            "start_offset": cursor.selectionStart() - start_block.position(),
+            "end_record": self._display_records[end_index],
+            "end_offset": cursor.selectionEnd() - end_block.position(),
+        }
+
+    def _restore_display_selection(self, anchor: dict) -> None:
+        """选区的两端记录都仍在保留内容中时恢复原选区，否则保持无选区。"""
+        selection = anchor.get("selection")
+        if selection is None:
+            return
+        start_block = self._record_block_number(selection["start_record"])
+        end_block = self._record_block_number(selection["end_record"])
+        if start_block is None or end_block is None:
+            return
+        document = self.display_edit.document()
+        last_position = max(0, document.characterCount() - 1)
+        start = min(
+            document.findBlockByNumber(start_block).position()
+            + selection["start_offset"],
+            last_position,
+        )
+        end = min(
+            document.findBlockByNumber(end_block).position()
+            + selection["end_offset"],
+            last_position,
+        )
+        cursor = QTextCursor(document)
+        cursor.setPosition(min(start, end))
+        cursor.setPosition(max(start, end), QTextCursor.MoveMode.KeepAnchor)
+        self.display_edit.setTextCursor(cursor)
+
+    def _apply_anchor_block(self) -> None:
+        """把锚定记录放到视口顶部；范围变化时可反复调用。
+
+        用真实 QTextCursor 定位后再按字体行高换算滚动行数，不依赖
+        ``setPlainText`` 后可能过期的滚动范围；已有选区在重定位后恢复。
+        """
+        block_number = self._scroll_anchor_block
+        if block_number is None:
+            return
+        document = self.display_edit.document()
+        if not 0 <= block_number < document.blockCount():
+            return
+        edit = self.display_edit
+        scrollbar = edit.verticalScrollBar()
+        previous = edit.textCursor()
+        cursor = QTextCursor(document)
+        cursor.setPosition(document.findBlockByNumber(block_number).position())
+        edit.setTextCursor(cursor)
+        edit.ensureCursorVisible()
+        line_spacing = max(1, edit.fontMetrics().lineSpacing())
+        lines_above = int(round(edit.cursorRect().top() / line_spacing))
+        target = max(0, min(scrollbar.value() + lines_above, scrollbar.maximum()))
+        self._apply_anchor_value(target)
+        if previous.hasSelection():
+            edit.setTextCursor(previous)
+            self._apply_anchor_value(target)
 
     def _restore_display_anchor(self, anchor: dict, text: str) -> None:
         if self._follow_latest:
-            self._scroll_anchor_value = None
+            self._scroll_anchor_block = None
             self._scroll_to_end()
             return
-        scrollbar = self.display_edit.verticalScrollBar()
         if text.startswith(anchor["text"]):
-            value = min(anchor["value"], scrollbar.maximum())
-        else:
-            value = (
-                round(anchor["ratio"] * scrollbar.maximum())
-                if scrollbar.maximum()
-                else 0
+            # 文本未丢失前缀（如失败重同步）：保持原滚动值即可。
+            value = min(
+                anchor["value"], self.display_edit.verticalScrollBar().maximum()
             )
-        self._apply_anchor_value(value)
-        self._scroll_anchor_value = value
+            self._apply_anchor_value(value)
+            self._scroll_anchor_block = self._record_block_number(anchor.get("record"))
+            self._restore_display_selection(anchor)
+            return
+        block_number = self._record_block_number(anchor.get("record"))
+        if block_number is None and self._display_records:
+            # 锚定记录本身已被淘汰：停在最早保留记录，不做比例跳变。
+            block_number = 0
+        self._scroll_anchor_block = block_number
+        self._restore_display_selection(anchor)
+        self._apply_anchor_block()
 
     def _begin_scroll_settle(self) -> None:
         """本轮事件循环结束后落定最终滚动位置，纠正 Qt 延迟布局。"""
@@ -842,12 +970,12 @@ class OscilloscopePage(QWidget):
         QTimer.singleShot(0, lambda: self._finish_scroll_settle(generation))
 
     def _finish_scroll_settle(self, generation: int) -> None:
-        if generation != self._scroll_settle_generation:
+        if generation != self._scroll_settle_generation or self._user_scroll_pending:
             return
         if self._follow_latest:
             self._scroll_to_end()
-        elif self._scroll_anchor_value is not None:
-            self._apply_anchor_value(self._scroll_anchor_value)
+        elif self._scroll_anchor_block is not None:
+            self._apply_anchor_block()
 
     # ------------------------------------------------------------ channels
 
@@ -986,9 +1114,9 @@ class OscilloscopePage(QWidget):
     def _update_hover(self, viewport_x: float, viewport_y: float) -> None:
         """在最靠近指针的可见通道真实原始采样上显示整帧读值。
 
-        邻近距离在屏幕/视口尺度上计算，但返回值只能来自 ``session.samples``
-        的原始点；短帧缺失通道不生成虚构读数。没有开启通道、指针远离
-        任何有效原始点时隐藏。
+        先按指针 ±8 像素的 X 像素带查询候选原始帧，再只对候选帧计算
+        屏幕距离；返回值只能来自模型保留的真实帧，短帧缺失通道不生成
+        虚构读数。没有开启通道、指针远离任何有效原始点时隐藏。
         """
         if not self._any_channel_enabled():
             self._hide_hover()
@@ -997,9 +1125,10 @@ class OscilloscopePage(QWidget):
         if chart_position is None:
             self._hide_hover()
             return
+        x_low, x_high = self._hover_time_band(chart_position)
         best_sample = None
         best_distance = HOVER_DISTANCE_PX
-        for sample in self.session.samples:
+        for sample in self.session.iter_samples_in_range(x_low, x_high):
             values = sample.values
             for index in range(min(len(values), self.session.channel_count)):
                 if not self._channel_enabled(index):
@@ -1020,6 +1149,28 @@ class OscilloscopePage(QWidget):
         self.hover_label.setText(self._format_hover(best_sample))
         self._position_hover_label(viewport_x, viewport_y)
         self.hover_label.setVisible(True)
+
+    def _hover_time_band(self, chart_position) -> tuple[float, float]:
+        """指针图表坐标 ±HOVER_DISTANCE_PX 对应的 X 值带。
+
+        带外的点在屏幕距离上必然超过阈值，因此可安全用作候选过滤；
+        像素到值的换算由当前图表/QValueAxis 映射完成，不靠手工轴数学。
+        """
+        left = self.chart.mapToValue(
+            QPointF(
+                chart_position.x() - HOVER_DISTANCE_PX, chart_position.y()
+            ),
+            self.ch1_series,
+        ).x()
+        right = self.chart.mapToValue(
+            QPointF(
+                chart_position.x() + HOVER_DISTANCE_PX, chart_position.y()
+            ),
+            self.ch1_series,
+        ).x()
+        if left <= right:
+            return left, right
+        return right, left
 
     def _hide_hover(self) -> None:
         self.hover_label.setVisible(False)
