@@ -813,8 +813,21 @@ class MainWindow(QMainWindow):
 
         本轮排空在开始时固定消费者：波形页资源失败的回调会在处理中途
         关闭连接并丢弃队列，本批已取出的帧不得改道数据页或二次补收。
+
+        波形页排空途中内存不足（事件/原始块/诊断/错误收集）与接收线程
+        资源失败走同一非模态停页路径：保留已提交历史并关闭串口解锁；
+        数据页原行为不变，本轮异常仍原样上抛。
         """
         owner = self._receive_owner
+        try:
+            self._drain_owner_queues(owner)
+        except MemoryError as error:
+            if owner != "waveform":
+                raise
+            self.oscilloscope_page.report_resource_failure(error)
+
+    def _drain_owner_queues(self, owner) -> None:
+        """本轮排空的实现：调用方已固定接收消费者。"""
         received_queue = self.received_queue
         error_queue = self.error_queue
 

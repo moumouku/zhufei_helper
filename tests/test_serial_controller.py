@@ -485,6 +485,87 @@ def test_reset_receive_session_rejects_read_that_started_before_reset():
         controller.close()
 
 
+def test_reset_receive_session_allocation_failure_keeps_session_intact(monkeypatch):
+    """替代队列分配中途失败：整体失败且旧代次/队列/分帧尾部保持不变。
+
+    ``reset_receive_session`` 在任何状态变更之前先分配全部替代队列；第二个
+    队列构造抛 ``MemoryError`` 时必须原样抛出，旧队列身份、当前读取代次、
+    未完成帧尾部与待处理数据全部保留，之后重试仍能正常清空。
+    """
+    import paimon_assistant.serial_controller as serial_controller
+
+    factory = GatedFactory([[b"AB\r", b"C\r\n", b"Z\r\n", b"Y\r\n"]])
+    controller = SerialController(
+        serial_factory=factory, port_lister=FakePortLister([])
+    )
+    serial = None
+    try:
+        controller.open(make_settings("COM1"))
+        serial = factory.instances[0]
+        assert wait_until(lambda: serial.read_starts >= 1), "reader never parked"
+
+        old_received = controller.received_queue
+        old_diagnostic = controller.diagnostic_queue
+        old_raw = controller.raw_queue
+        old_generation = controller._generation
+        old_received.put(ReceivedEvent(0, b"pending", b"pending\r\n"))
+        old_diagnostic.put("pending diagnostic")
+        old_raw.put(b"pending raw")
+
+        serial.release()  # 只送 `AB\r`：framer 保留未完成尾部
+        assert wait_until(lambda: serial.read_starts >= 2), "第一块未被分帧处理完"
+
+        allocations = []
+
+        def flaky_new_queue():
+            allocations.append(1)
+            if len(allocations) == 2:
+                raise MemoryError("injected queue allocation failure")
+            return queue.Queue()
+
+        # 通过模块级分配边界注入：第二个替代队列构造失败。
+        monkeypatch.setattr(
+            serial_controller, "_new_queue", flaky_new_queue, raising=False
+        )
+        with pytest.raises(MemoryError):
+            controller.reset_receive_session()
+
+        assert controller.received_queue is old_received
+        assert controller.diagnostic_queue is old_diagnostic
+        assert controller.raw_queue is old_raw
+        assert controller._generation == old_generation
+        assert controller.is_open
+
+        serial.release()  # `C\r\n` 必须与清空失败前保留的尾部合成一帧
+        assert wait_until(lambda: old_received.qsize() >= 2), "在途读取未继续发布"
+        events = collect_events(old_received, 2)
+        # 字节流 `AB\rC\r\n`：幸存的 CR 尾部与后续字节组成同一帧 payload。
+        assert [event.payload for event in events] == [b"pending", b"AB\rC"]
+        assert old_diagnostic.qsize() == 1
+        assert old_raw.qsize() == 1
+
+        # 重试清空成功：替换全部队列、丢弃旧数据并越过代次边界。
+        assert wait_until(lambda: serial.read_starts >= 3), "第二次读取未继续"
+        origin = controller.reset_receive_session()
+        assert origin is not None
+        assert controller.received_queue is not old_received
+        assert controller.diagnostic_queue is not old_diagnostic
+        assert controller.raw_queue is not old_raw
+        assert old_received.empty() and old_diagnostic.empty() and old_raw.empty()
+
+        serial.release()  # 清空前开始的读取：整块被新代次拒绝
+        assert wait_until(lambda: serial.read_starts >= 4), "清空后 reader 未继续读"
+        assert controller.received_queue.empty()
+
+        serial.release()  # 清空后开始的读取：正常发布新帧
+        assert controller.received_queue.get(timeout=2.0).payload == b"Y"
+        assert controller.received_queue.empty()
+    finally:
+        if serial is not None:
+            serial.release()
+        controller.close()
+
+
 def test_reset_receive_session_returns_new_origin_only_while_open():
     """The waveform clear origin is captured inside the session lock.
 

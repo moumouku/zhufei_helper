@@ -63,6 +63,16 @@ def _epoch_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _new_queue() -> queue.Queue:
+    """Allocation boundary for replacement session queues.
+
+    ``reset_receive_session`` allocates all three replacements here before it
+    mutates any session state, so an allocation failure (including
+    ``MemoryError``) leaves the old generation, queues and framer untouched.
+    """
+    return queue.Queue()
+
+
 def _discard_pending(q: queue.Queue) -> None:
     """Drop every item currently queued (used when a session is reset)."""
     while True:
@@ -388,21 +398,29 @@ class SerialController:
         this same lock while the connection is open, or ``None`` when closed.
         The waveform page uses it to re-anchor without a second clock read;
         other callers may ignore it (REQ-0005 §9.2).
+
+        All three replacement queues are allocated before the lock, so an
+        allocation failure raises without mutating the session: the old
+        generation, queue identities, framer tail and pending data all stay
+        valid and the caller can report the clear as failed.
         """
+        new_received = _new_queue()
+        new_diagnostic = _new_queue()
+        new_raw = _new_queue()
         with self._session_lock:
             origin_ns = self._monotonic_ns() if self._is_open else None
             self._generation += 1
             old_received = self.received_queue
             old_diagnostic = self.diagnostic_queue
             old_raw = self.raw_queue
-            self.received_queue = queue.Queue()
-            self.diagnostic_queue = queue.Queue()
-            self.raw_queue = queue.Queue()
+            self.received_queue = new_received
+            self.diagnostic_queue = new_diagnostic
+            self.raw_queue = new_raw
             session = self._session
             if session is not None:
-                session.received_queue = self.received_queue
-                session.diagnostic_queue = self.diagnostic_queue
-                session.raw_queue = self.raw_queue
+                session.received_queue = new_received
+                session.diagnostic_queue = new_diagnostic
+                session.raw_queue = new_raw
                 session.framer.reset()
             _discard_pending(old_received)
             _discard_pending(old_diagnostic)

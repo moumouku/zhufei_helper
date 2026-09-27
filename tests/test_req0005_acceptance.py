@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import queue
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ from paimon_assistant.oscilloscope import (  # noqa: E402
     CompactSampleStore,
     OscilloscopeSession,
 )
+from paimon_assistant.receive_framer import ReceivedEvent  # noqa: E402
 from paimon_assistant.receive_log import ReceiveLogService  # noqa: E402
 from paimon_assistant.serial_controller import (  # noqa: E402
     SerialController,
@@ -370,6 +372,76 @@ def test_resource_failure_discards_stale_queues_when_session_reset_fails(
     assert "资源" in page.diagnostic_label.text()
     critical, warning = silent_dialogs
     assert critical == [] and warning == []
+    window.close()
+
+
+class DrainMemoryFailureQueue:
+    """排空收集替身：取出一条事件后 ``get_nowait`` 抛 ``MemoryError``。
+
+    ``list.append`` 无法直接注入内存失败，因此在收集列表时从队列边界模拟：
+    已取出一条事件、下一次取空时失败；之后退化为普通空队列，让停止路径
+    的清理循环能正常结束。
+    """
+
+    def __init__(self, first_item) -> None:
+        self._item = first_item
+        self._raised = False
+
+    def get_nowait(self):
+        if self._item is not None:
+            item, self._item = self._item, None
+            return item
+        if not self._raised:
+            self._raised = True
+            raise MemoryError("injected drain collection failure")
+        raise queue.Empty
+
+    def empty(self) -> bool:
+        return self._item is None
+
+
+def test_wave_drain_collection_memory_failure_stops_cleanly_and_keeps_history(
+    qtbot, mw, tmp_path, silent_dialogs
+):
+    """波形页排空收集内存失败：非模态资源停页、保历史、不泄漏数据页。"""
+    clock = StepClock(monotonic_ns=1_000_000_000)
+    controller, factory = make_real_controller(clock)
+    window = make_window(qtbot, mw, tmp_path, controller, monotonic_ns=clock.mono)
+    page = window.oscilloscope_page
+    window.page_tabs.setCurrentIndex(1)
+    page.start_button.click()
+    serial = factory.instances[0]
+
+    clock.monotonic_ns = 1_100_000_000
+    serial.feed(b"12\r\n")
+    serial.release()
+    assert wait_until(lambda: not controller.received_queue.empty())
+    window._drain_queues()
+    assert [sample.values for sample in page.session.samples] == [(12,)]
+    assert not page.has_resource_failure
+
+    # 收到队列换成收集失败替身：本批事件取出第一条后 MemoryError。
+    controller.received_queue = DrainMemoryFailureQueue(
+        ReceivedEvent(1_100, b"99", b"99\r\n", 1_200_000_000)
+    )
+    window._drain_queues()
+
+    assert not controller.is_open, "排空收集资源失败必须关闭物理串口"
+    assert serial.closed
+    assert not page.is_receiving
+    assert page.has_resource_failure
+    assert window.page_tabs.tabBar().isEnabled(), "排空资源失败必须解除切页锁"
+    assert "资源" in page.diagnostic_label.text()
+    assert [sample.values for sample in page.session.samples] == [
+        (12,)
+    ], "已提交历史必须保留"
+    assert [record.values for record in page.session.records] == [(12,)]
+    assert window._event_history == [], "半批事件不得进入数据页"
+    assert window.display_edit.toPlainText() == ""
+    assert window._raw_history.raw() == b""
+    assert window.receive_error_label.text() == ""
+    critical, warning = silent_dialogs
+    assert critical == [] and warning == [], "排空资源失败用页面内非模态诊断"
     window.close()
 
 
