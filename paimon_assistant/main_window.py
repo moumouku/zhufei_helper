@@ -33,7 +33,9 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStatusBar,
     QStyle,
+    QTabBar,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -56,6 +58,27 @@ HEX_MODE = "HEX"
 #: 接收解析模式（REQ-0004 §3.1）：默认严格 `\r\n` 分帧，可选原始字节。
 FRAMED_MODE = "按 \\r\\n 分帧"
 RAW_MODE = "原始字节"
+
+#: 数据页问号提示：解释两种接收解析模式和单片机应发送的帧结束方式。
+_DATA_PROTOCOL_HELP = (
+    "数据页接收协议\n"
+    "按 \\r\\n 分帧：单片机每条数据末尾发送 CRLF（\\r\\n，回车+换行），"
+    "收到完整边界后显示一条数据并写入接收日志。\n"
+    "示例：temperature=25.6\\r\\n\n"
+    "原始字节：收到字节后立即显示，不等待 \\r\\n，不分帧，也不写入接收日志。\n"
+    "当前“解析”选项决定实际行为。"
+)
+
+#: 波形页问号提示：只描述正常使用所需的十进制数值接收格式。
+_WAVEFORM_PROTOCOL_HELP = (
+    "波形页接收协议\n"
+    "单片机每帧发送 1～8 个有符号十进制数值；多个数值用英文半角逗号分隔。\n"
+    "每帧末尾发送 CRLF（\\r\\n，回车+换行），字段顺序对应 CH1、CH2 ……\n"
+    "合法示例：\n"
+    "12\\r\\n\n"
+    "0.96,328.00\\r\\n\n"
+    "-10,+20.5,0030\\r\\n"
+)
 
 _PARITY_ITEMS = ["N", "E", "O", "M", "S"]
 _LOG_WRITE_FAILED_TEXT = "日志写入失败，请检查磁盘空间或权限"
@@ -163,6 +186,18 @@ class MainWindow(QMainWindow):
             OscilloscopeSession(monotonic_ns=self._monotonic_ns), self
         )
         self.page_tabs.addTab(self.oscilloscope_page, "波形")
+        self.data_protocol_help_button = self._add_protocol_help_button(
+            0,
+            "data_protocol_help_button",
+            "数据页协议说明",
+            _DATA_PROTOCOL_HELP,
+        )
+        self.waveform_protocol_help_button = self._add_protocol_help_button(
+            1,
+            "waveform_protocol_help_button",
+            "波形页协议说明",
+            _WAVEFORM_PROTOCOL_HELP,
+        )
         root.addWidget(self.page_tabs, 1)
 
         data_layout = QVBoxLayout(self._data_page)
@@ -250,6 +285,28 @@ class MainWindow(QMainWindow):
         self._set_tab_order()
         self.setMinimumSize(760, 480)
         self.resize(1080, 680)
+
+    def _add_protocol_help_button(
+        self,
+        index: int,
+        object_name: str,
+        accessible_name: str,
+        tooltip: str,
+    ) -> QToolButton:
+        """Add an independent ``?`` affordance to one page tab."""
+        button = QToolButton(self.page_tabs.tabBar())
+        button.setObjectName(object_name)
+        button.setText("?")
+        button.setToolTip(tooltip)
+        button.setAccessibleName(accessible_name)
+        button.setAccessibleDescription("悬停查看本页面的串口接收协议说明")
+        button.setAutoRaise(True)
+        button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        button.setFixedSize(22, 22)
+        self.page_tabs.tabBar().setTabButton(
+            index, QTabBar.ButtonPosition.RightSide, button
+        )
+        return button
 
     def _build_connection_bar(self, root: QVBoxLayout) -> None:
         self._connection_main = QWidget()

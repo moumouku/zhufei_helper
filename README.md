@@ -4,8 +4,9 @@
 
 版本状态：
 
-- 当前版本：`v0.6.0`，源码与 EXE 已同步到 `main` 和同名版本标签
-- Branches 只保留 `main`；历史版本见 [Tags](https://github.com/moumouku/zhufei_helper/tags)
+- 当前已发布版本：`v0.7.0`，源码与 EXE 已同步到远端 `main` 和同名版本标签
+- `v0.6.0` 仍作为历史版本保留，历史版本见 [Tags](https://github.com/moumouku/zhufei_helper/tags)
+- Branches 只保留 `main`
 
 完整操作步骤见 [docs/user-manual.md](docs/user-manual.md)。
 按功能独立管理的需求文档见 [docs/requirements/index.md](docs/requirements/index.md)。
@@ -22,16 +23,16 @@ PaimonAssistant.exe
 ```
 
 - **直接下载最新版 EXE（main）**：[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/heads/main/PaimonAssistant.exe)
-- **固定版本 v0.6.0 EXE（Tag）**：[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/tags/v0.6.0/PaimonAssistant.exe)
-- 版本源码及文件：[v0.6.0](https://github.com/moumouku/zhufei_helper/tree/v0.6.0)
+- **固定版本 v0.7.0 EXE（Tag）**：[PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/tags/v0.7.0/PaimonAssistant.exe)
+- 历史版本源码及文件：[v0.6.0](https://github.com/moumouku/zhufei_helper/tree/v0.6.0)
 - 全部版本：[Tags](https://github.com/moumouku/zhufei_helper/tags)
 
-`main` 与 `v0.6.0` 标签的根目录都包含已验证的 `PaimonAssistant.exe`，支持小数波形和原始载荷正文。下载后即可运行，文件大小为 49,218,386 字节。以后 main 链接随新版本更新，v0.6.0 标签链接固定保留本版本。
+已发布 `v0.7.0` 的 `main` 与标签根目录都包含已验证的 `PaimonAssistant.exe`，支持分页协议帮助、波形和原始载荷正文。下载后即可运行，文件大小为 49,219,212 字节。以后 main 链接随新版本更新，版本标签链接固定保留对应版本。
 
-当前文件 SHA256：
+已发布 `v0.7.0` 文件 SHA256：
 
 ```text
-c8842a33a91d62710ceb81f5763f71940050742dc0961c039771c44693987eca
+906da8be545757aae20722552699dd4cb094f5060738f200ae3fe15139682dae
 ```
 
 下载后可用下面的命令校验：
@@ -46,6 +47,7 @@ Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
 
 - 深色「派蒙·石墨」界面：按“连接、接收、发送”分区，接收数据是视觉中心；界面中文使用 Microsoft YaHei UI，接收显示区与发送输入框使用 Consolas 等宽字体
 - 默认窗口 1080 x 680、最小 760 x 480；窗口底部状态栏显示连接状态、端口与串口参数、解析模式和日志状态
+- “数据”和“波形”分页标签右侧各有一个 `?` 协议说明入口；鼠标悬停即可查看对应页面的接收规则和单片机发送示例
 - 串口参数使用可折叠行，按钮实时显示 `8N1`、`7E1.5` 等摘要；展开/收起不重置参数
 - “跟随最新”默认开启（数据页；“波形”页数据显示区和图表也有各自的跟随/回到最新）：上翻历史时自动暂停跟随并继续接收与写日志，点击“回到最新”恢复；两种解析模式分别记住各自阅读位置
 - 同一时刻只有一个主操作：数据页未连接突出“打开”，波形页停止时突出“开始接收”，活动接收时突出“发送”
@@ -72,9 +74,9 @@ Get-FileHash .\PaimonAssistant.exe -Algorithm SHA256
 - 串口打开、读写、断开异常会提示并恢复到可重新打开的状态
 - `v0.6.0` 新增“数据/波形”双页面与独立示波器：严格 `\r\n` 分帧的 1～8 通道有符号十进制数值协议，兼容整数并支持小数、单调时钟相对时间 `T+`、最近 180 秒无损原始采样、动态通道与断线缺口、X/Y 缩放平移与真实点悬停、线性化清空/新建采集和资源故障停页保数据；波形接收正文只显示原始载荷，详见下方“波形页”一节
 
-## 波形页（v0.6.0）
+## 波形页（v0.7.0）
 
-“波形”页已包含在 `main` 和 `v0.6.0` 标签的 EXE 与源码中。它使用自己的严格 `\r\n` 分帧器和十进制数值协议解析器，与数据页互斥地共用同一个物理串口。
+“波形”页已包含在 `main` 和 `v0.7.0` 标签的 EXE 与源码中。它使用自己的严格 `\r\n` 分帧器和十进制数值协议解析器，与数据页互斥地共用同一个物理串口。
 
 - **页面与接收互斥**：启动默认进入“数据”页。同一时刻最多只有一页接收；开始接收后页面切换被锁定，必须停止接收（关闭物理串口）后才能切页。切页后另一页保持停止，需手动开始；两页的接收历史、分帧器、解析状态和清空操作完全独立，互不回放历史。
 - **十进制数值协议**：严格以连续 `0D 0A` 作为唯一帧结束边界。完整载荷必须是 1～8 个 ASCII 有符号十进制数值，语法为 `[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(,[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)){0,7}`，取值范围为 `-2147483648..2147483647`；兼容整数、正负号和前导零，也接受 `0.96`、`.5`、`1.`。不接受空格、TAB、空字段、尾逗号、指数、`NaN`、`Inf`、HEX 或超过 8 个字段。合法帧产生采样；完整非法帧仍显示原始载荷，但在正文外标记“解析失败”，不产生点、不改变通道数。所有完整帧都按既有 RX 格式写日志，未完成帧和超过 1 MiB 后丢弃的帧不写日志。

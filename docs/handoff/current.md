@@ -1,15 +1,32 @@
-# 当前交接：v0.6.0 已交付 main 与 Tags
+# 当前交接：v0.7.0 已交付 main 与 Tags
+
+## 本轮发布
+
+本轮在已交付 `v0.6.0` 基线上新增分页协议帮助，以 `v0.7.0` 交付：
+
+- “数据”和“波形”分页标签右侧各增加独立 `?` 控件，鼠标悬停显示对应页面的多行接收协议说明。
+- 数据页说明“按 `\\r\\n` 分帧”和“原始字节”两种模式，并给出单片机合法示例；波形页说明 1～8 个有符号十进制数值、半角逗号、`\\r\\n` 结束符和合法示例。
+- 现有日志启动清理保持不变：按日期文件名保留当天及此前 30 个日历日，不按修改时间清理。
+- 变更涉及 `paimon_assistant/main_window.py`、`paimon_assistant/theme.py`、分页回归测试及 README、用户手册、CHANGELOG、界面设计记录；`receive_log.py` 未修改。
+
+## 本轮验证与交付资料
+
+- 全量测试：`621 passed, 6 skipped`。
+- 源码编译、`main.py --smoke-test`、PyInstaller 6.22.0 干净构建和打包程序 `--smoke-test` 均通过。
+- 本地根目录 EXE 大小 `49,219,212` 字节，SHA256 `906da8be545757aae20722552699dd4cb094f5060738f200ae3fe15139682dae`；`dist/PaimonAssistant.exe` 与根目录一致。
+- 当前版本号为 `0.7.0`；发布提交和 `v0.7.0` 标签在本轮提交/推送后记录。
+- 本地工作区存在未跟踪 `NUL`，按既有规则保留。
 
 ## 目标与位置
 
-REQ-0005 与 issues 012～020 已完成开发、集成和验证。用户明确指定最终交付规则：Branches 只保留 `main`，v0.6.0 进入 Tags 并同步 main，两处均提供可直接下载的 EXE；以后都按此流程交付。
+REQ-0005 与 issues 012～020 已完成开发、集成和验证。当前发布规则为：Branches 只保留 `main`，每个版本进入 Tags 并同步 main，两处均提供可直接下载的 EXE；以后都按此流程交付。
 
-- 当前发布提交：本次 handoff 收口提交完成后创建 `v0.6.0` 注释标签；该提交包含已验收源码、根目录 EXE、下载文档和新的 main/Tags 交付规则。
-- 目标推送：`origin/main` 与注释标签 `origin/v0.6.0`；两者应指向同一发布提交。GitHub Release 本次不另行创建。
+- 当前发布提交：本轮分页协议帮助补丁、源码版本、文档和根目录 EXE 进入 `v0.7.0` 发布提交；`v0.6.0` 历史标签保持不变。
+- 目标推送：`origin/main` 与注释标签 `origin/v0.7.0`；两者应指向同一发布提交。GitHub Release 本次不另行创建。
 - 工作目录：`E:/projects_learning/zhufei_helps`。
 - 已验收源码基线：`898f958`；`97d1731` 纳入已验证的 EXE。main 已快进包含全部成果，本次仅补齐发布规则、标签和文档，生产源码与测试不变。
 - 原未提交 handoff 已保存在 Git stash（说明为 `Preserve pre-sync REQ-0005 handoff before workspace update`），原始文件、补丁和校验记录另存于 `.git/req0005-preserved/pre-sync-c333afe-898f958/`。该旧文件记录的是实施前状态，不应直接覆盖当前交接。未跟踪的 `NUL` 仍原样保留。
-- 12 个 REQ-0005 临时 worktree 已移除；4 个旧 REQ-0002 worktree 的未提交源码、本机配置及补丁已逐文件备份校验到 `.git/main-only-v0.6.0-backup/`，所有清理前分支和标签保存在其中的 `branches.bundle`。本次发布成功后清理开发分支及旧 worktree，本地与远端只保留 main；共用 `.venv`、备份与 stash 保留。
+- 12 个 REQ-0005 临时 worktree 已移除；4 个旧 REQ-0002 worktree 的未提交源码、本机配置及补丁已逐文件备份校验到 `.git/main-only-v0.6.0-backup/`，所有清理前分支和标签保存在其中的 `branches.bundle`。本次发布后清理开发分支及旧 worktree，本地与远端只保留 main；共用 `.venv`、备份与 stash 保留。
 
 ## 已交付
 

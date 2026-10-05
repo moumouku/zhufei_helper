@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from PySide6.QtWidgets import QTabBar
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from paimon_assistant.receive_log import ReceiveLogService  # noqa: E402
@@ -202,6 +204,27 @@ def test_window_starts_on_data_page_with_both_pages_stopped(window, controller):
     window.page_tabs.setCurrentIndex(0)
     assert window.page_tabs.currentIndex() == 0
     assert window.open_button.text() == "打开"
+
+
+def test_page_tabs_expose_protocol_help_tooltips(window):
+    tab_bar = window.page_tabs.tabBar()
+    data_help = tab_bar.tabButton(0, QTabBar.ButtonPosition.RightSide)
+    waveform_help = tab_bar.tabButton(1, QTabBar.ButtonPosition.RightSide)
+
+    assert data_help is window.data_protocol_help_button
+    assert waveform_help is window.waveform_protocol_help_button
+    assert data_help.text() == "?"
+    assert waveform_help.text() == "?"
+    assert data_help.accessibleName() == "数据页协议说明"
+    assert waveform_help.accessibleName() == "波形页协议说明"
+    assert "按 \\r\\n 分帧" in data_help.toolTip()
+    assert "原始字节" in data_help.toolTip()
+    assert "temperature=25.6\\r\\n" in data_help.toolTip()
+    assert "单片机" in waveform_help.toolTip()
+    assert "0.96,328.00\\r\\n" in waveform_help.toolTip()
+    assert "-10,+20.5,0030\\r\\n" in waveform_help.toolTip()
+    assert "派蒙助手发送" not in data_help.toolTip()
+    assert "派蒙助手发送" not in waveform_help.toolTip()
 
 
 # ------------------------------------------- 单帧显示、CH1 采样与绘图

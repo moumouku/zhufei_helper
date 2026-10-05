@@ -92,7 +92,7 @@ GitHub 默认页面显示 `main` 的最新内容；Tags 保存各个版本快照
 当前发布路径示例：
 
 - 最新版：[main/PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/heads/main/PaimonAssistant.exe)
-- 固定版本：[v0.6.0/PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/tags/v0.6.0/PaimonAssistant.exe)
+- 固定版本：[v0.7.0/PaimonAssistant.exe](https://raw.githubusercontent.com/moumouku/zhufei_helper/refs/tags/v0.7.0/PaimonAssistant.exe)
 - 版本列表：[Tags](https://github.com/moumouku/zhufei_helper/tags)
 
 Git 标签和 GitHub Release 是两种不同对象；本项目默认交付 `main` + Tags + EXE，不自动要求创建 Release。

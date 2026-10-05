@@ -149,6 +149,29 @@ QTabBar::tab:disabled {{
     background-color: {c['window']};
     border-color: {c['divider']};
 }}
+QTabBar QToolButton {{
+    background-color: transparent;
+    color: {c['secondary']};
+    border: 1px solid transparent;
+    border-radius: {s['radius']}px;
+    min-width: 20px;
+    max-width: 20px;
+    min-height: 20px;
+    max-height: 20px;
+    padding: 0px;
+    font-weight: bold;
+}}
+QTabBar QToolButton:hover {{
+    background-color: {c['hover']};
+    color: {c['text']};
+}}
+QTabBar QToolButton:focus {{
+    border-color: {c['accent']};
+}}
+QTabBar QToolButton:disabled {{
+    color: {c['muted']};
+    background-color: transparent;
+}}
 QLabel {{
     background-color: transparent;
     color: {c['secondary']};
